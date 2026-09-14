@@ -1,0 +1,142 @@
+package dev.dhruv.streaming.runtime;
+
+import dev.dhruv.streaming.api.Collector;
+import dev.dhruv.streaming.api.Source;
+import dev.dhruv.streaming.api.StreamRecord;
+import dev.dhruv.streaming.api.TimestampAssigner;
+import dev.dhruv.streaming.api.Watermark;
+import dev.dhruv.streaming.api.metrics.Counter;
+import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Optional;
+
+/**
+ * One running instance of one source.
+ *
+ * <p>A source task has no inbound queue, which is the one structural way it differs from every
+ * other task: records originate here rather than arriving. So instead of a loop that waits on a
+ * queue, it has a loop that asks the source for whatever it has.
+ *
+ * <p>The pull shape is what makes backpressure reach all the way to the broker. When the job
+ * downstream slows, this task blocks inside {@code emit}, which means it stops calling
+ * {@link Source#poll}, which means nothing is fetched. No signal has to travel backwards and no
+ * component has to decide what to discard -- the source simply is not asked.
+ */
+final class SourceTask implements Runnable {
+
+    private static final Logger log = LoggerFactory.getLogger(SourceTask.class);
+
+    private final String taskId;
+    private final Source<Object> source;
+    private final RuntimeSourceContext context;
+    private final Output output;
+    private final Optional<TimestampAssigner<Object>> timestampAssigner;
+    private final TaskMetricGroup metrics;
+    private final Counter recordsOut;
+
+    private volatile boolean running = true;
+
+    @SuppressWarnings("unchecked")
+    SourceTask(String taskId,
+               Source<?> source,
+               RuntimeSourceContext context,
+               Output output,
+               Optional<? extends TimestampAssigner<?>> timestampAssigner,
+               TaskMetricGroup metrics) {
+        this.taskId = taskId;
+        this.source = (Source<Object>) source;
+        this.context = context;
+        this.output = output;
+        this.timestampAssigner = (Optional<TimestampAssigner<Object>>) timestampAssigner;
+        this.metrics = metrics;
+        this.recordsOut = metrics.counter("records-out");
+    }
+
+    @Override
+    public void run() {
+        log.info("source task {} starting", taskId);
+        try {
+            source.open(context);
+
+            Collector<Object> collector = new SourceCollector();
+            boolean moreAvailable = true;
+            while (running && moreAvailable) {
+                moreAvailable = source.poll(collector);
+            }
+
+            if (!moreAvailable) {
+                // The source is permanently exhausted. MAX closes every window still open
+                // downstream, so a bounded replay finishes cleanly instead of leaving its last
+                // sessions unemitted. An unbounded source never reaches this.
+                log.info("source task {} reached end of stream", taskId);
+                output.broadcast(Watermark.MAX);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("source task {} interrupted, stopping", taskId);
+        } catch (TaskCancelledException e) {
+            log.info("source task {} cancelled: {}", taskId, e.getMessage());
+        } catch (Exception e) {
+            // Phase 2 reports this to the master, which fails the job.
+            log.error("source task {} failed", taskId, e);
+        } finally {
+            closeQuietly();
+            log.info("source task {} stopped after {} records", taskId, recordsOut.count());
+        }
+    }
+
+    /**
+     * Asks this task to stop once the source returns from its current poll.
+     */
+    void cancel() {
+        running = false;
+    }
+
+    String taskId() {
+        return taskId;
+    }
+
+    TaskMetricGroup metrics() {
+        return metrics;
+    }
+
+    private void closeQuietly() {
+        try {
+            source.close();
+        } catch (Exception e) {
+            log.warn("source task {} failed to close its source cleanly", taskId, e);
+        }
+        output.close();
+    }
+
+    /**
+     * Stamps each emitted value with its event time on the way past.
+     *
+     * <p>This is the only place in the engine where event time is assigned. A source with no
+     * assigner configured emits records stamped {@link Long#MIN_VALUE}, which is honest: the
+     * job has not been told when anything happened, and any window downstream will say so by
+     * never firing.
+     */
+    private final class SourceCollector implements Collector<Object> {
+
+        @Override
+        public void collect(Object value) {
+            collect(value, timestampAssigner
+                    .map(assigner -> assigner.extractTimestamp(value))
+                    .orElse(Long.MIN_VALUE));
+        }
+
+        @Override
+        public void collect(Object value, long timestamp) {
+            try {
+                output.emit(new StreamRecord<>(value, timestamp));
+                recordsOut.increment();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new TaskCancelledException("cancelled while emitting from source");
+            }
+        }
+    }
+}

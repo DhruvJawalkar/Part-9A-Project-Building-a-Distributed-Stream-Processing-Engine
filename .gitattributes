@@ -1,0 +1,14 @@
+# Normalize to LF in the repository. The build runs on Windows, Linux and in containers, and a
+# CRLF that reached a shell script inside a container would fail in a confusing way.
+* text=auto eol=lf
+
+# Scripts executed inside containers must be LF regardless of platform.
+*.sh text eol=lf
+gradlew text eol=lf
+
+# Windows-only files keep CRLF.
+*.bat text eol=crlf
+
+# Binaries.
+*.pdf binary
+*.jar binary

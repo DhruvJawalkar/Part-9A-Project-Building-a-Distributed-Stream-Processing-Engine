@@ -1,0 +1,21 @@
+# Dependency versions for the whole build.
+# Entries are added phase by phase, so this file doubles as a record of what each
+# phase actually needed. Phase 1 needs a Kafka client, a logging backend and a test stack.
+
+[versions]
+junit    = "5.11.4"
+assertj  = "3.26.3"
+slf4j    = "2.0.16"
+logback  = "1.5.12"
+kafka    = "3.9.0"
+jackson  = "2.18.2"
+
+[libraries]
+junit-bom      = { module = "org.junit:junit-bom",                version.ref = "junit" }
+junit-jupiter  = { module = "org.junit.jupiter:junit-jupiter" }
+junit-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+assertj        = { module = "org.assertj:assertj-core",           version.ref = "assertj" }
+slf4j-api      = { module = "org.slf4j:slf4j-api",                version.ref = "slf4j" }
+logback        = { module = "ch.qos.logback:logback-classic",     version.ref = "logback" }
+kafka-clients  = { module = "org.apache.kafka:kafka-clients",     version.ref = "kafka" }
+jackson        = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }

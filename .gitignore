@@ -1,0 +1,24 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local, machine-specific Gradle overrides (e.g. org.gradle.java.home)
+local.properties
+
+# Engine runtime output
+/checkpoints/
+/warehouse/
+*.log

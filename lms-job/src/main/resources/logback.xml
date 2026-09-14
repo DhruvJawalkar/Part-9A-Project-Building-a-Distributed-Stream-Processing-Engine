@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logging for the LMS job.
+
+  Lifecycle events at INFO: tasks starting, stopping, connecting. Per-record paths never log at
+  INFO. A stream engine processing ten thousand records a second that logs a line for each one
+  is not observable; it is a denial of service against its own operator.
+
+  The Kafka client is held at WARN because its INFO output is voluminous and is about the
+  consumer's internals rather than about the job.
+-->
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="dev.dhruv.streaming" level="INFO"/>
+    <logger name="org.apache.kafka" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>

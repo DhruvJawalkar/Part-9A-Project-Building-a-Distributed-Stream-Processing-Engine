@@ -1,0 +1,20 @@
+{"memberId":"m-1001","catalogItemId":"","searchTerm":"distributed systems","eventType":"SEARCH","eventTimeMillis":1757836800000}
+{"memberId":"m-1001","catalogItemId":"cat-7741","searchTerm":"distributed systems","eventType":"RESULT_CLICK","eventTimeMillis":1757836812000}
+{"memberId":"bot-crawler-3","catalogItemId":"cat-0001","searchTerm":"*","eventType":"RESULT_CLICK","eventTimeMillis":1757836813000}
+{"memberId":"m-1002","catalogItemId":"","searchTerm":"kafka streams","eventType":"SEARCH","eventTimeMillis":1757836820000}
+{"memberId":"m-1001","catalogItemId":"cat-7742","searchTerm":"distributed systems","eventType":"RESULT_CLICK","eventTimeMillis":1757836831000}
+{"memberId":"bot-crawler-3","catalogItemId":"cat-0002","searchTerm":"*","eventType":"RESULT_CLICK","eventTimeMillis":1757836835000}
+{"memberId":"m-1002","catalogItemId":"cat-3390","searchTerm":"kafka streams","eventType":"RESULT_CLICK","eventTimeMillis":1757836844000}
+{"memberId":"m-1003","catalogItemId":"","searchTerm":"event sourcing","eventType":"SEARCH","eventTimeMillis":1757836850000}
+{"memberId":"m-1001","catalogItemId":"cat-7741","searchTerm":"distributed systems","eventType":"RESULT_CLICK","eventTimeMillis":1757836858000}
+{"memberId":"","catalogItemId":"cat-9999","searchTerm":"broken","eventType":"RESULT_CLICK","eventTimeMillis":1757836860000}
+{"memberId":"m-1003","catalogItemId":"cat-5512","searchTerm":"event sourcing","eventType":"RESULT_CLICK","eventTimeMillis":1757836866000}
+{"memberId":"m-1004","catalogItemId":"","searchTerm":"raft consensus","eventType":"SEARCH","eventTimeMillis":1757836870000}
+{"memberId":"bot-loadtest-9","catalogItemId":"cat-0003","searchTerm":"*","eventType":"RESULT_CLICK","eventTimeMillis":1757836872000}
+{"memberId":"m-1002","catalogItemId":"cat-3391","searchTerm":"kafka streams","eventType":"RESULT_CLICK","eventTimeMillis":1757836878000}
+{"memberId":"m-1004","catalogItemId":"cat-6620","searchTerm":"raft consensus","eventType":"RESULT_CLICK","eventTimeMillis":1757836885000}
+{"memberId":"m-1005","catalogItemId":"","searchTerm":"stream processing","eventType":"SEARCH","eventTimeMillis":1757836890000}
+{"memberId":"m-1003","catalogItemId":"cat-5513","searchTerm":"event sourcing","eventType":"RESULT_CLICK","eventTimeMillis":1757836897000}
+{"memberId":"m-1005","catalogItemId":"cat-7741","searchTerm":"stream processing","eventType":"RESULT_CLICK","eventTimeMillis":1757836905000}
+{"memberId":"m-1001","catalogItemId":"cat-7743","searchTerm":"distributed systems","eventType":"RESULT_CLICK","eventTimeMillis":1757836911000}
+{"memberId":"m-9999","catalogItemId":"cat-1234","searchTerm":"no timestamp","eventType":"RESULT_CLICK","eventTimeMillis":0}
