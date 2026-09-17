@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package dev.dhruv.streaming.rpc;
+
+import "common.proto";
+
+option java_package = "dev.dhruv.streaming.rpc";
+option java_multiple_files = true;
+
+// What the master says to workers. Task lifecycle and checkpoint control.
+service WorkerService {
+  rpc DeployTask (TaskDeployment) returns (DeployAck);
+  rpc CancelTask (TaskId) returns (Empty);
+
+  // Sources only. Barriers are injected at the head of the graph and flow with the records.
+  rpc TriggerCheckpoint (CheckpointTrigger) returns (Empty);
+
+  // Sinks only. This is the commit signal of the engine's two-phase commit (Phase 6).
+  rpc NotifyCheckpointComplete (CheckpointId) returns (Empty);
+
+  rpc RestoreTask (RestoreRequest) returns (Empty);
+}
+
+// Everything a worker needs to run one chain group, in one message.
+//
+// The user code travels as serialized Java objects. That is the cost of letting a job author
+// write a lambda: the class must exist on the worker's classpath, and the instance must
+// serialize. Both constraints are surfaced early, by Phase 1's local executor, which copies
+// each subtask's operator in exactly this way.
+message TaskDeployment {
+  string job_id = 1;
+  string chain_group_id = 2;
+  int32 subtask_index = 3;
+  int32 parallelism = 4;
+
+  repeated ChainedOperator operators = 5;   // fused into one thread, in order
+  repeated InputChannel inputs = 6;
+  repeated OutputChannel outputs = 7;
+
+  // Phase 4: the state handle this task restores from before processing anything.
+  string state_handle_uri = 8;
+}
+
+message ChainedOperator {
+  string operator_id = 1;
+  OperatorKind kind = 2;
+  bytes serialized_operator = 3;             // the user's Operator, or Source for a source
+  bytes serialized_key_selector = 4;         // present when this operator's input is hashed
+  bytes serialized_timestamp_assigner = 5;   // sources only
+  int64 out_of_orderness_millis = 6;
+  int64 idle_timeout_millis = 7;
+}
+
+enum OperatorKind {
+  OPERATOR_KIND_UNSPECIFIED = 0;
+  OPERATOR_SOURCE = 1;
+  OPERATOR_TRANSFORM = 2;
+  OPERATOR_SINK = 3;
+}
+
+// Where this task's records come from. One per upstream subtask, which is also the unit that
+// barrier alignment works over in Phase 4: a channel is the thing that gets blocked.
+message InputChannel {
+  string upstream_operator_id = 1;
+  int32 upstream_subtask_index = 2;
+  ExchangeStrategy exchange = 3;
+}
+
+// Where this task's records go. The address is carried here so that a sender never has to ask
+// the master where a peer is; the deployment already said.
+message OutputChannel {
+  string downstream_operator_id = 1;
+  int32 downstream_subtask_index = 2;
+  ExchangeStrategy exchange = 3;
+  string host = 4;
+  int32 data_port = 5;
+  bool local = 6;    // same worker: hand over in memory rather than over the wire
+}
+
+enum ExchangeStrategy {
+  EXCHANGE_UNSPECIFIED = 0;
+  EXCHANGE_FORWARD = 1;
+  EXCHANGE_HASH = 2;
+  EXCHANGE_BROADCAST = 3;
+  EXCHANGE_REBALANCE = 4;
+}
+
+message DeployAck {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+message CheckpointTrigger {
+  int64 checkpoint_id = 1;
+  int64 trigger_ts = 2;
+}
+
+message CheckpointId {
+  int64 checkpoint_id = 1;
+}
+
+message RestoreRequest {
+  TaskId task_id = 1;
+  string state_handle_uri = 2;
+}

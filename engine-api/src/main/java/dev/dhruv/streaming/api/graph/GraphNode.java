@@ -9,7 +9,6 @@ import dev.dhruv.streaming.api.TimestampAssigner;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * A node while the graph is still being written: mutable, permissive, and not yet checked.
@@ -62,7 +61,7 @@ final class GraphNode {
                     id,
                     parallelism,
                     source,
-                    Optional.ofNullable(timestampAssigner),
+                    timestampAssigner,
                     outOfOrderness,
                     idleTimeout);
             case TRANSFORM -> new TransformNode(
@@ -71,16 +70,16 @@ final class GraphNode {
                     List.copyOf(upstreamIds),
                     inputExchange,
                     operator,
-                    Optional.ofNullable(keySelector),
-                    Optional.ofNullable(partitionName));
+                    keySelector,
+                    partitionName);
             case SINK -> new SinkNode(
                     id,
                     parallelism,
                     List.copyOf(upstreamIds),
                     inputExchange,
                     (Operator<?, Void>) operator,
-                    Optional.ofNullable(keySelector),
-                    Optional.ofNullable(partitionName));
+                    keySelector,
+                    partitionName);
         };
     }
 }

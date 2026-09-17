@@ -22,3 +22,6 @@ local.properties
 /checkpoints/
 /warehouse/
 *.log
+
+# Worker and master logs from demos/run-cluster.sh
+/demos/logs/

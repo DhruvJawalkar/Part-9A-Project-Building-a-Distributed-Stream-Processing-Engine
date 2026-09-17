@@ -17,11 +17,11 @@ import dev.dhruv.streaming.api.state.ValueState;
  * would let a job run, produce plausible output, and be wrong -- the single worst outcome for
  * an engine whose entire purpose is to be trusted with state.
  */
-final class RuntimeOperatorContext implements OperatorContext {
+public final class RuntimeOperatorContext implements OperatorContext {
 
     private final MetricGroup metrics;
 
-    RuntimeOperatorContext(MetricGroup metrics) {
+    public RuntimeOperatorContext(MetricGroup metrics) {
         this.metrics = metrics;
     }
 

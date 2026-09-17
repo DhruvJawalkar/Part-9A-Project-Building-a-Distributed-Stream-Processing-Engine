@@ -11,7 +11,6 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.List;
-import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -66,7 +65,7 @@ class JobGraphTest {
             List<LogicalOperator> operators = List.of(
                     source("clicks"),
                     new TransformNode("a", -3, List.of("clicks"), ExchangeStrategy.FORWARD,
-                            passThrough(), Optional.empty(), Optional.empty()));
+                            passThrough(), null, null));
 
             assertThatThrownBy(() -> new JobGraph("job-1", "negative", 128, operators))
                     .isInstanceOf(InvalidJobGraphException.class)
@@ -79,7 +78,7 @@ class JobGraphTest {
             List<LogicalOperator> operators = List.of(
                     source("clicks"),
                     new TransformNode("a", 9, List.of("clicks"), ExchangeStrategy.FORWARD,
-                            passThrough(), Optional.empty(), Optional.empty()));
+                            passThrough(), null, null));
 
             assertThatThrownBy(() -> new JobGraph("job-1", "too-parallel", 8, operators))
                     .isInstanceOf(InvalidJobGraphException.class)
@@ -127,7 +126,7 @@ class JobGraphTest {
             List<LogicalOperator> operators = List.of(
                     source("clicks"),
                     new TransformNode("sessions", 1, List.of("clicks"), ExchangeStrategy.HASH,
-                            passThrough(), Optional.empty(), Optional.empty()));
+                            passThrough(), null, null));
 
             assertThatThrownBy(() -> new JobGraph("job-1", "unhashable", 128, operators))
                     .isInstanceOf(InvalidJobGraphException.class)
@@ -257,13 +256,13 @@ class JobGraphTest {
     // -------------------------------------------------------------------------------------
 
     private static SourceNode source(String id) {
-        return new SourceNode(id, 1, noopSource(), Optional.empty(),
+        return new SourceNode(id, 1, noopSource(), null,
                 Duration.ZERO, Duration.ZERO);
     }
 
     private static TransformNode transform(String id, List<String> upstreamIds) {
         return new TransformNode(id, 1, upstreamIds, ExchangeStrategy.FORWARD,
-                passThrough(), Optional.empty(), Optional.empty());
+                passThrough(), null, null);
     }
 
     private static Operator<String, String> passThrough() {

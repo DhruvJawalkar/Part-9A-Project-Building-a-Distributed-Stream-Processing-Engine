@@ -1,6 +1,7 @@
 package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.Collector;
+import dev.dhruv.streaming.runtime.transport.Output;
 import dev.dhruv.streaming.api.StreamRecord;
 
 /**

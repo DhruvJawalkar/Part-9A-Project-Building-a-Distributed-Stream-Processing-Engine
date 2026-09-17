@@ -20,14 +20,15 @@ import java.util.Optional;
  * identified merely as "a node with no downstream" would work, but the graph would stop
  * recording that the author meant this to be an output.
  *
- * @param id            stable operator id
- * @param parallelism   number of parallel subtasks
- * @param upstreamIds   the operators feeding this sink
- * @param inputExchange how records are routed to this sink's subtasks
- * @param operator      the sink logic, serialized to whichever worker runs it
- * @param keySelector   present exactly when {@code inputExchange} is
- *                      {@link ExchangeStrategy#HASH}
- * @param partitionName the user-supplied name of the keying step, for logs and metrics
+ * @param id                  stable operator id
+ * @param parallelism         number of parallel subtasks
+ * @param upstreamIds         the operators feeding this sink
+ * @param inputExchange       how records are routed to this sink's subtasks
+ * @param operator            the sink logic, serialized to whichever worker runs it
+ * @param keySelectorOrNull   non-null exactly when {@code inputExchange} is
+ *                            {@link ExchangeStrategy#HASH}. Prefer {@link #keySelector()}.
+ * @param partitionNameOrNull the user's name for the keying step, for logs and metrics. Prefer
+ *                            {@link #partitionName()}.
  */
 public record SinkNode(
         String id,
@@ -35,7 +36,27 @@ public record SinkNode(
         List<String> upstreamIds,
         ExchangeStrategy inputExchange,
         Operator<?, Void> operator,
-        Optional<KeySelector<?, ?>> keySelector,
-        Optional<String> partitionName
+        KeySelector<?, ?> keySelectorOrNull,
+        String partitionNameOrNull
 ) implements LogicalOperator {
+
+    private static final long serialVersionUID = 1L;
+
+    /**
+     * Returns how to extract this sink's partitioning key, if it is keyed.
+     *
+     * @return the key selector, if any
+     */
+    public Optional<KeySelector<?, ?>> keySelector() {
+        return Optional.ofNullable(keySelectorOrNull);
+    }
+
+    /**
+     * Returns the user's name for the keying step, if there was one.
+     *
+     * @return the partition name, if any
+     */
+    public Optional<String> partitionName() {
+        return Optional.ofNullable(partitionNameOrNull);
+    }
 }

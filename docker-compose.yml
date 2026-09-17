@@ -65,5 +65,33 @@ services:
         echo "topics ready:"
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --list
 
+  # Metadata store for the master: job graphs, assignments, job state, and from Phase 4 the
+  # latest checkpoint pointer. Also the worker registry -- workers register under a TTL lease,
+  # so a crashed one disappears on its own and the master learns of it by watching the prefix.
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    container_name: lms-etcd
+    ports:
+      - "2379:2379"
+    environment:
+      ETCD_NAME: etcd-1
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd:2380
+      ETCD_INITIAL_CLUSTER: etcd-1=http://etcd:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: lms-stream-engine
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
 volumes:
   kafka-data:
+  etcd-data:

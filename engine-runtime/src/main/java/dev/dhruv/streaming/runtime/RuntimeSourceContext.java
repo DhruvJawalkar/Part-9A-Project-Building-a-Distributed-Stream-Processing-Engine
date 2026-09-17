@@ -10,6 +10,6 @@ import dev.dhruv.streaming.api.metrics.MetricGroup;
  * @param parallelism  how many subtasks the source operator runs as
  * @param metrics      this subtask's metric group
  */
-record RuntimeSourceContext(int subtaskIndex, int parallelism, MetricGroup metrics)
+public record RuntimeSourceContext(int subtaskIndex, int parallelism, MetricGroup metrics)
         implements SourceContext {
 }

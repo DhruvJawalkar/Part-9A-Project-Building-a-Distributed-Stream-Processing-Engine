@@ -29,7 +29,7 @@ implementation stops is part of understanding what production engines do for you
 | Phase | What it adds | State |
 |---|---|---|
 | **1** | Single-process engine: Kafka → filter → console | **Complete** |
-| 2 | Master and worker processes, gRPC transport, etcd | Not started |
+| **2** | Master and worker processes, gRPC transport, etcd | **Complete** |
 | 3 | Event time, watermarks, session windows | Not started |
 | 4 | Checkpointing, barrier alignment, recovery | Not started |
 | 5 | The interval join | Not started |
@@ -88,17 +88,25 @@ The dependency direction is strict and enforced by Gradle rather than by convent
 engine-api/          No runtime dependencies, ever. StreamElement, Operator, KeyedOperator,
                      OperatorContext, state interfaces, JobGraph builder, ExchangeStrategy,
                      KeyGroupAssigner.
-engine-runtime/      → engine-api
-                     Task run loop, output routing, state backends, serialization, transport.
-engine-master/       → engine-api, engine-runtime
-                     JobMaster, Scheduler, ExecutionGraph compiler, CheckpointCoordinator.
-engine-worker/       → engine-api, engine-runtime
-                     Worker bootstrap, task deployment, gRPC servers, heartbeat client.
+engine-rpc/          No engine dependencies. The .proto wire contracts and generated stubs.
+engine-metadata/     No engine dependencies. MetadataStore, etcd and in-memory implementations.
+engine-runtime/      → engine-api, engine-rpc
+                     Task run loop, operator chaining, input gates, transport, serialization.
+engine-master/       → engine-api, engine-rpc, engine-metadata, engine-runtime
+                     JobMaster, ExecutionGraph compiler, TaskTracker, JobClient.
+engine-worker/       → engine-api, engine-rpc, engine-metadata, engine-runtime
+                     Worker bootstrap, TaskManager, gRPC servers, heartbeat client.
 engine-connectors/   → engine-api, engine-runtime
                      KafkaSource, IcebergSink, ConsoleSink, FileReplaySource.
 lms-job/             → engine-api, engine-connectors
                      The LMS clickstream job, and its main().
 ```
+
+`engine-rpc` and `engine-metadata` exist for the same reason: the control plane has two ends.
+`engine-master` serves `MasterService` and calls `WorkerService`; `engine-worker` does the
+reverse. Both need the same wire types and the same view of etcd, and neither should depend on
+the other. A module holding only contracts, depending on no engine module, points inward from
+both sides and leaves the dependency direction intact.
 
 `engine-api` having **zero** dependencies is a hard constraint, verifiable with
 `./gradlew :engine-api:dependencies --configuration runtimeClasspath`. It is the surface a job
@@ -143,6 +151,55 @@ it would arrive on a channel that will never deliver the records it is meant to 
 
 ---
 
+## What Phase 2 built
+
+Run a real cluster:
+
+```bash
+docker compose up -d                  # Kafka and etcd
+./demos/run-cluster.sh                # master on :7000, three workers on :7001-7003
+./demos/seed-clicks.sh                # publish the fixture
+./gradlew :lms-job:submitToCluster    # submit to the master
+./demos/run-cluster.sh stop
+```
+
+Worker logs land in `demos/logs/`. The job compiles to **6 tasks across all 3 workers**, and the
+15 surviving records are printed by sink tasks on machines that did not read them from Kafka.
+
+- **Wire contracts** — `MasterService`, `WorkerService`, `DataTransportService`, per PDF §6.
+- **`ExecutionGraphCompiler`** — expands operators to subtasks, fuses chains, assigns vertical
+  slices round-robin.
+- **`ChainBuilder`** — the four conditions for fusing two operators into one thread.
+- **`EtcdMetadataStore`** — the PDF §8.3 key layout, worker leases, prefix watches.
+- **`TaskTracker`** — 1s heartbeats, dead after 3 missed.
+- **Transport** — `InputGate` with one queue per channel, batching on size or
+  `bufferTimeoutMs`, and credit-based flow control.
+- **94 unit tests** plus 7 etcd integration tests (`./gradlew :engine-metadata:integrationTest`).
+
+### Four bugs worth knowing about
+
+All four were found by running the cluster, and all four are now pinned by tests.
+
+**A credit deadlock that looked like nothing happening.** A sender starts at zero credit and
+waits for permission. The receiver granted credit only *after* receiving a buffer — so it was
+waiting for a buffer the sender was not allowed to send. Every process healthy, job `RUNNING`, no
+errors, no records. The opening grant must be sent when the stream opens, before any data.
+
+**gRPC `Context` cancellation killing the data streams.** The record streams are opened while
+handling the master's `DeployTask` call, so they inherited that server call's `Context` — which
+is cancelled the instant the handler returns. Long-lived connections must be opened under
+`Context.ROOT`.
+
+**`OperatorChain` zeroed event time.** `out.collect(value)` deliberately takes no timestamp, and
+the chain never seeded it from the incoming record, so every chained operator saw the epoch.
+Nothing failed; windows downstream would simply have been wrong. Caught by a test, not by a run.
+
+**The client compiled and deployed the job itself.** It worked, until a worker died and the
+master had never been told the job existed. Submission now goes through `MasterService.SubmitJob`
+— whoever must react to failure has to be the one that knows what is running.
+
+---
+
 ## Known limitations
 
 Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
@@ -156,9 +213,13 @@ Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
 | No SQL or higher-level API | Framework DSLs are Parts 9B and 9C | A minimal SQL parser producing a `JobGraph` |
 | No security, multi-tenancy or resource isolation | Orthogonal to every mechanism being taught | — |
 
-Additionally, as of Phase 1: there is no distribution, no state, and no checkpointing. Offsets
-are committed by Kafka on its own schedule, which is at-least-once and nothing stronger. Phase 4
-replaces that with offsets held in the checkpoint.
+Additionally, as of Phase 2: there is no state and no checkpointing, so a worker death fails the
+job outright -- there is no consistent point to rewind to yet, and creating one is what Phase 4 is
+for. Offsets are still committed by Kafka on its own schedule, which is at-least-once and nothing
+stronger. Keyed (`HASH`) exchanges are rejected with a message naming Phase 3, which adds them
+along with keyed state. Job classes reach the master and workers through a `JOB_CLASSPATH` set at
+startup rather than being shipped with the submission, so every process needs the same classpath
+and changing the job means restarting them.
 
 ---
 

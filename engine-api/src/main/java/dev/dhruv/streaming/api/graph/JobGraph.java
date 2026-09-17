@@ -4,6 +4,7 @@ import dev.dhruv.streaming.api.ExchangeStrategy;
 import dev.dhruv.streaming.api.KeyGroupAssigner;
 import dev.dhruv.streaming.api.Source;
 
+import java.io.Serializable;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -39,7 +40,7 @@ public record JobGraph(
         String name,
         int maxParallelism,
         List<LogicalOperator> operators
-) {
+) implements Serializable {
 
     /**
      * Validates and freezes the graph.

@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package dev.dhruv.streaming.rpc;
+
+option java_package = "dev.dhruv.streaming.rpc";
+option java_multiple_files = true;
+
+// Types shared by more than one service.
+
+message Empty {}
+
+// Identifies one running subtask: one parallel instance of one operator of one job.
+message TaskId {
+  string job_id = 1;
+  string operator_id = 2;   // stable, user-assigned. Checkpointed state is filed under it.
+  int32 subtask_index = 3;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_RUNNING = 1;
+  TASK_FINISHED = 2;
+  TASK_FAILED = 3;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_CREATED = 1;
+  JOB_RUNNING = 2;
+  JOB_FINISHED = 3;
+  JOB_FAILING = 4;
+  JOB_FAILED = 5;
+  // Phase 4 adds JOB_RESTARTING between FAILING and RUNNING. Phase 2 has nothing to recover
+  // to, so a failure here is terminal.
+}

@@ -1,5 +1,6 @@
 package dev.dhruv.streaming.api.graph;
 
+import java.io.Serializable;
 import java.util.List;
 
 /**
@@ -11,11 +12,16 @@ import java.util.List;
  * checkpoint completed. Making the compiler enforce that a switch covers all three is worth
  * more than the flexibility of a single node type with nullable fields.
  *
+ * <p>Serializable because the master writes the whole graph to etcd at submission, so that a
+ * restarted master recovers the job rather than losing it. Every field a node holds -- including
+ * the user's operators and sources -- therefore has to serialize too, which is the same
+ * constraint deploying a task to a worker imposes, discovered at the same moment.
+ *
  * @see SourceNode
  * @see TransformNode
  * @see SinkNode
  */
-public sealed interface LogicalOperator
+public sealed interface LogicalOperator extends Serializable
         permits SourceNode, TransformNode, SinkNode {
 
     /**

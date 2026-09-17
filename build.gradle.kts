@@ -4,6 +4,9 @@
 
 plugins {
     `java-library`
+    // Applied only by engine-runtime, which owns the .proto files. Declared here so the
+    // version lives in one place.
+    alias(libs.plugins.protobuf) apply false
 }
 
 allprojects {
@@ -41,6 +44,7 @@ subprojects {
         add("testImplementation", platform(libs.findLibrary("junit-bom").get()))
         add("testImplementation", libs.findLibrary("junit-jupiter").get())
         add("testImplementation", libs.findLibrary("assertj").get())
+        add("testImplementation", libs.findLibrary("awaitility").get())
         add("testRuntimeOnly", libs.findLibrary("junit-launcher").get())
     }
 

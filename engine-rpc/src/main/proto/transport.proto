@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package dev.dhruv.streaming.rpc;
+
+option java_package = "dev.dhruv.streaming.rpc";
+option java_multiple_files = true;
+
+// Records moving between workers.
+//
+// Deliberately a separate service, on a separate port, from the control plane. A job under
+// load saturates this path; heartbeats must not queue behind it, or a busy worker would be
+// indistinguishable from a dead one and the master would start killing healthy jobs.
+service DataTransportService {
+
+  // One long-lived bidirectional stream per (sender subtask, receiver subtask) pair.
+  //
+  // The receiver sends credit upstream; the sender ships buffers within it. This is the
+  // rebuilt version of what a bounded queue gave away for free in Phase 1: over a network,
+  // nothing stops a fast sender from overwhelming a slow receiver unless the receiver is the
+  // one deciding how much may be in flight.
+  rpc ExchangeRecords (stream DataBuffer) returns (stream CreditGrant);
+}
+
+message DataBuffer {
+  // Identifies the sending subtask as "{operatorId}#{subtaskIndex}". The receiver looks this
+  // up to find which of its input channels the buffer belongs to -- the identity that
+  // watermark tracking and barrier alignment both work in terms of.
+  string sender_task_id = 1;
+
+  int32 target_subtask = 2;
+  bytes payload = 3;          // N serialized StreamElements, batched
+  int32 element_count = 4;
+
+  // Which operator the buffer is for. With target_subtask this names exactly one running task
+  // on the receiving worker. Carried per buffer rather than negotiated once when the stream
+  // opens, so that a buffer is self-describing and a reader can follow one from the wire to the
+  // gate it lands in without tracking connection state.
+  string target_operator_id = 5;
+}
+
+// How many more buffers the receiver is willing to accept.
+//
+// The first grant arrives before any data, which is what lets the sender start at all.
+message CreditGrant {
+  string receiver_task_id = 1;
+  int32 buffers = 2;
+}

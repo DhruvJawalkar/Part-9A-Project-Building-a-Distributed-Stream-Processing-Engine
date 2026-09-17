@@ -41,19 +41,21 @@ Code style: standard Java conventions, 4-space indent, 110-column soft limit. Re
 
 ## 3. Module layout
 
-Create exactly these six Gradle modules. The dependency direction is strict and must not be violated.
+Create these Gradle modules. The dependency direction is strict and must not be violated.
 
 ```
 engine-api/          No runtime dependencies. StreamElement, Operator, KeyedOperator,
                      OperatorContext, ValueState, ListState, StateBackend, JobGraph builder,
                      ExchangeStrategy, KeyGroupAssigner.
-engine-runtime/      depends on: engine-api
+engine-rpc/          No engine dependencies (added — see below).
+                     The .proto wire contracts and the stubs generated from them.
+engine-runtime/      depends on: engine-api, engine-rpc
                      Task run loop, WatermarkTracker, BarrierAligner, TimerService,
                      InMemoryStateBackend, RocksDbStateBackend, serialization, RecordTransport.
-engine-master/       depends on: engine-api, engine-runtime (for graph types only)
+engine-master/       depends on: engine-api, engine-rpc, engine-runtime (graph types only)
                      JobMaster, Scheduler, ExecutionGraph compiler, CheckpointCoordinator,
                      TaskTracker, EtcdMetadataStore, StatusApi.
-engine-worker/       depends on: engine-api, engine-runtime
+engine-worker/       depends on: engine-api, engine-rpc, engine-runtime
                      Worker bootstrap, task deployment, gRPC servers, heartbeat client.
 engine-connectors/   depends on: engine-api, engine-runtime
                      KafkaSource, IcebergSink, ConsoleSink, FileReplaySource (for demos).
@@ -75,6 +77,17 @@ lms-job/             depends on: engine-api, engine-connectors (amended — see 
 > declares `engine-runtime` as `implementation`, not `api`, so runtime internals never reach
 > `lms-job`'s compile classpath. Gradle enforces it, not good intentions — if a job class
 > cannot see a runtime type, that is the rule working.
+
+> **Amendment — Phase 2, 2026-09-16.** Added a seventh module, `engine-rpc`, holding the
+> `.proto` contracts and the stubs generated from them. The control plane has two ends:
+> `engine-master` serves `MasterService` and calls `WorkerService`; `engine-worker` does the
+> reverse. Both need the same generated types and neither should depend on the other. The
+> contracts had been put in `engine-runtime` purely because it was the only existing module both
+> could see, which made the runtime the accidental owner of definitions it has no stake in.
+>
+> The six-module count is not itself load-bearing; the dependency **direction** is. A module
+> holding only wire contracts, depending on no engine module, points inward from both sides and
+> leaves that direction intact.
 
 ---
 
@@ -109,7 +122,25 @@ Add a class-level Javadoc explaining the two-hop mapping: `key → key group (fi
 
 Everywhere else the PDF says "MAX_PARALLELISM", read "NUM_KEY_GROUPS".
 
-### 4.2 Everything else in the PDF stands
+### 4.2 A slot is one vertical pipeline slice
+
+PDF §8.1 contradicts itself within a sentence: "round-robin **subtasks** across registered
+workers, subject to one rule — all subtasks of a chained group land **together**." Both cannot
+hold. Its code snippet assigns whole chain groups; its prose says "a slot in this project is
+one vertical pipeline slice, mirroring Flink rather than Storm."
+
+**Follow the prose.** The unit of scheduling is subtask *i* of every operator in a chain group,
+together — one vertical slice. Round-robin distributes slices, and it does *not* apply within a
+slice: the chained operators of one slice are fused into a single thread and are not separately
+schedulable.
+
+Assigning whole chain groups instead would cap a job's spread at its number of chain groups,
+however parallel its operators were. The Phase 1 LMS job compiles to two chain groups
+(`clicks→drop-bots` fused, then `console`), so on a three-worker cluster one worker would sit
+idle and Phase 2's acceptance criterion "a submitted job distributes across all three" would
+fail on its own terms. As vertical slices the same job compiles to six tasks across all three.
+
+### 4.3 Everything else in the PDF stands
 
 Interfaces in PDF §5, gRPC contracts in §6, and the phase structure in §7–13 are all authoritative. Follow them closely — the article cross-references specific names.
 

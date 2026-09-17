@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package dev.dhruv.streaming.rpc;
+
+import "common.proto";
+
+option java_package = "dev.dhruv.streaming.rpc";
+option java_multiple_files = true;
+
+// What workers say to the master.
+//
+// Liveness and acknowledgement only. The master drives; workers report. Keeping this service
+// free of anything a worker might block on is what stops a slow data path from starving the
+// control plane -- record traffic goes over DataTransportService, on its own connections.
+service MasterService {
+  // Submission goes through the master rather than being done by the client directly, and that
+  // is not ceremony. The master has to be the one that knows a job exists: it is what watches
+  // for the worker deaths that should fail it. A client that compiled and deployed on its own
+  // would leave a job running that nobody was supervising.
+  rpc SubmitJob (JobSubmission) returns (SubmitAck);
+
+  rpc RegisterWorker (WorkerInfo) returns (RegisterAck);
+
+  // Bidirectional and long-lived: the worker's beats go up, the master's commands come back
+  // down the same stream. The master learns a worker is gone by the stream falling silent,
+  // which costs it nothing to watch.
+  rpc Heartbeat (stream WorkerBeat) returns (stream MasterCommand);
+
+  rpc AcknowledgeCheckpoint (CheckpointAck) returns (Empty);
+  rpc ReportTaskFailure (TaskFailure) returns (Empty);
+}
+
+message JobSubmission {
+  // The serialized JobGraph. The master deserializes it to compile a physical plan, which means
+  // the master needs the job's classes on its classpath too -- the same obligation every worker
+  // has, for the same reason.
+  bytes serialized_graph = 1;
+
+  // How many workers must be registered before scheduling, and how long to wait for them.
+  int32 minimum_workers = 2;
+  int64 wait_timeout_millis = 3;
+}
+
+message SubmitAck {
+  bool accepted = 1;
+  string reason = 2;
+  string job_id = 3;
+  int32 task_count = 4;
+  repeated string worker_ids = 5;
+  // "chainGroupId:subtask -> workerId", for the client to print.
+  repeated string assignments = 6;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  string host = 2;
+  int32 rpc_port = 3;       // WorkerService
+  int32 data_port = 4;      // DataTransportService, deliberately a separate listener
+  int32 slots = 5;          // how many chain groups this worker will accept
+}
+
+message RegisterAck {
+  bool accepted = 1;
+  string reason = 2;
+  int64 heartbeat_interval_millis = 3;
+}
+
+message WorkerBeat {
+  string worker_id = 1;
+  repeated TaskStatus tasks = 2;
+  int64 current_watermark = 3;      // lowest across this worker's tasks, for the status API
+  int64 records_processed = 4;
+  int64 source_lag_millis = 5;
+}
+
+message TaskStatus {
+  TaskId task_id = 1;
+  TaskState state = 2;
+  int64 records_in = 3;
+  int64 records_out = 4;
+  int64 current_watermark = 5;
+
+  // Phase 4 reports checkpoint cost here: duration, state size and alignment time. Declared
+  // now because the heartbeat is the natural carrier and adding fields later would mean
+  // revisiting every producer of this message.
+  int64 last_checkpoint_id = 6;
+  int64 last_checkpoint_duration_millis = 7;
+  int64 last_checkpoint_state_bytes = 8;
+  int64 last_alignment_millis = 9;
+}
+
+// Commands travel back down the heartbeat stream rather than over a separate call, so the
+// master never needs to open a connection to a worker it has only just heard from.
+message MasterCommand {
+  oneof command {
+    Empty no_op = 1;
+    TaskId cancel_task = 2;
+    CancelJob cancel_job = 3;
+  }
+}
+
+message CancelJob {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message CheckpointAck {
+  string worker_id = 1;
+  TaskId task_id = 2;
+  int64 checkpoint_id = 3;
+  string state_handle_uri = 4;
+  int64 alignment_millis = 5;        // observability: what alignment actually cost
+  int64 state_size_bytes = 6;
+}
+
+message TaskFailure {
+  string worker_id = 1;
+  TaskId task_id = 2;
+  string message = 3;
+  string stack_trace = 4;
+}

@@ -7,24 +7,27 @@ import dev.dhruv.streaming.api.TimestampAssigner;
 import dev.dhruv.streaming.api.Watermark;
 import dev.dhruv.streaming.api.metrics.Counter;
 import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
+import dev.dhruv.streaming.runtime.transport.Output;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Optional;
+import java.util.function.BiConsumer;
 
 /**
  * One running instance of one source.
  *
- * <p>A source task has no inbound queue, which is the one structural way it differs from every
- * other task: records originate here rather than arriving. So instead of a loop that waits on a
- * queue, it has a loop that asks the source for whatever it has.
+ * <p>A source task has no input gate, which is the one structural way it differs from every
+ * other task: records originate here rather than arriving. So instead of a loop that waits on
+ * inputs, it has a loop that asks the source for whatever it has.
  *
  * <p>The pull shape is what makes backpressure reach all the way to the broker. When the job
- * downstream slows, this task blocks inside {@code emit}, which means it stops calling
- * {@link Source#poll}, which means nothing is fetched. No signal has to travel backwards and no
- * component has to decide what to discard -- the source simply is not asked.
+ * downstream slows, this task blocks inside {@code emit} -- on a full queue locally, or waiting
+ * for credit across the network -- which means it stops calling {@link Source#poll}, which means
+ * nothing is fetched. No signal has to travel backwards and no component has to decide what to
+ * discard. The source simply is not asked.
  */
-final class SourceTask implements Runnable {
+public final class SourceTask implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(SourceTask.class);
 
@@ -38,13 +41,27 @@ final class SourceTask implements Runnable {
 
     private volatile boolean running = true;
 
+    /** See {@link OperatorTask}: nothing listens in Phase 1, the worker listens from Phase 2. */
+    private BiConsumer<String, Throwable> failureListener = (taskId, failure) -> {
+    };
+
+    /**
+     * Creates a source task.
+     *
+     * @param taskId            identity for logs and for reporting failures
+     * @param source            the user's source, already a private copy for this subtask
+     * @param context           what this subtask should read
+     * @param output            where records go
+     * @param timestampAssigner how to read event time out of a record, if configured
+     * @param metrics           this subtask's metric group
+     */
     @SuppressWarnings("unchecked")
-    SourceTask(String taskId,
-               Source<?> source,
-               RuntimeSourceContext context,
-               Output output,
-               Optional<? extends TimestampAssigner<?>> timestampAssigner,
-               TaskMetricGroup metrics) {
+    public SourceTask(String taskId,
+                      Source<?> source,
+                      RuntimeSourceContext context,
+                      Output output,
+                      Optional<? extends TimestampAssigner<?>> timestampAssigner,
+                      TaskMetricGroup metrics) {
         this.taskId = taskId;
         this.source = (Source<Object>) source;
         this.context = context;
@@ -64,6 +81,10 @@ final class SourceTask implements Runnable {
             boolean moreAvailable = true;
             while (running && moreAvailable) {
                 moreAvailable = source.poll(collector);
+                // Ship whatever this poll produced rather than holding a partial buffer until
+                // the next one fills it. A source that polls every 200ms and batches by size
+                // alone would add the poll interval to every record's latency.
+                output.flush();
             }
 
             if (!moreAvailable) {
@@ -72,6 +93,7 @@ final class SourceTask implements Runnable {
                 // sessions unemitted. An unbounded source never reaches this.
                 log.info("source task {} reached end of stream", taskId);
                 output.broadcast(Watermark.MAX);
+                output.flush();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -79,8 +101,8 @@ final class SourceTask implements Runnable {
         } catch (TaskCancelledException e) {
             log.info("source task {} cancelled: {}", taskId, e.getMessage());
         } catch (Exception e) {
-            // Phase 2 reports this to the master, which fails the job.
             log.error("source task {} failed", taskId, e);
+            failureListener.accept(taskId, e);
         } finally {
             closeQuietly();
             log.info("source task {} stopped after {} records", taskId, recordsOut.count());
@@ -90,16 +112,35 @@ final class SourceTask implements Runnable {
     /**
      * Asks this task to stop once the source returns from its current poll.
      */
-    void cancel() {
+    public void cancel() {
         running = false;
     }
 
-    String taskId() {
+    /**
+     * Returns this task's id.
+     *
+     * @return the task id
+     */
+    public String taskId() {
         return taskId;
     }
 
-    TaskMetricGroup metrics() {
+    /**
+     * Returns this task's metrics.
+     *
+     * @return the metric group
+     */
+    public TaskMetricGroup metrics() {
         return metrics;
+    }
+
+    /**
+     * Registers what to do when this task fails.
+     *
+     * @param listener called with the task id and the failure
+     */
+    public void onFailure(BiConsumer<String, Throwable> listener) {
+        this.failureListener = listener;
     }
 
     private void closeQuietly() {
@@ -115,9 +156,9 @@ final class SourceTask implements Runnable {
      * Stamps each emitted value with its event time on the way past.
      *
      * <p>This is the only place in the engine where event time is assigned. A source with no
-     * assigner configured emits records stamped {@link Long#MIN_VALUE}, which is honest: the
-     * job has not been told when anything happened, and any window downstream will say so by
-     * never firing.
+     * assigner configured emits records stamped {@link Long#MIN_VALUE}, which is honest: the job
+     * has not been told when anything happened, and any window downstream will say so by never
+     * firing.
      */
     private final class SourceCollector implements Collector<Object> {
 

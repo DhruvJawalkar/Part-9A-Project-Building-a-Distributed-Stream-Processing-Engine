@@ -12,8 +12,8 @@ dependencies {
     implementation(project(":engine-api"))
     implementation(project(":engine-connectors"))
 
-    // NOTE what is absent: engine-runtime. The discipline that actually matters -- the job
-    // must never reach into the engine's internals -- is still enforced mechanically, because
+    // NOTE what is absent: engine-runtime. The discipline that actually matters -- the job must
+    // never reach into the engine's internals -- is still enforced mechanically, because
     // engine-connectors declares engine-runtime as `implementation` rather than `api`, so it
     // does not leak onto this module's compile classpath. If a job class ever fails to compile
     // because it cannot see a runtime type, that is the rule working, not a build problem.
@@ -23,4 +23,29 @@ dependencies {
 
 application {
     mainClass.set("dev.dhruv.streaming.lms.LmsClickstreamJob")
+}
+
+// A second entry point that submits the same job to a running cluster rather than executing it
+// in this process. Kept in its own source set so that the job module proper still compiles
+// against engine-api and engine-connectors alone -- the submitter needs the master's client,
+// and letting that into the job's main classpath would quietly undo the rule above.
+sourceSets {
+    create("submit") {
+        compileClasspath += sourceSets.main.get().output
+        runtimeClasspath += sourceSets.main.get().output
+    }
+}
+
+configurations["submitImplementation"].extendsFrom(configurations.implementation.get())
+configurations["submitRuntimeOnly"].extendsFrom(configurations.runtimeOnly.get())
+
+dependencies {
+    add("submitImplementation", project(":engine-master"))
+}
+
+tasks.register<JavaExec>("submitToCluster") {
+    description = "Submits the LMS job to a running master."
+    group = "application"
+    mainClass.set("dev.dhruv.streaming.lms.SubmitLmsJob")
+    classpath = sourceSets["submit"].runtimeClasspath
 }

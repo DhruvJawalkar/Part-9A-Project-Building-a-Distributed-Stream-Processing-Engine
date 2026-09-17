@@ -70,7 +70,7 @@ public final class LmsClickstreamJob {
      *
      * @return the validated job graph
      */
-    static JobGraph buildGraph() {
+    public static JobGraph buildGraph() {
         JobGraph.Builder job = JobGraph.named("lms-clickstream");
 
         DataStream<ClickEvent> clicks =

@@ -38,19 +38,40 @@ The target shape, from §4.1 of the companion PDF:
                                                        +----------------+
 ```
 
-**As of Phase 1, none of the control plane exists.** There is one process. The job graph is
-built in `main()`, handed to `LocalJobExecutor`, and run as one thread per subtask with bounded
-queues between them. Kafka is real; everything else in the diagram arrives later.
+**As of Phase 2 the control plane is real.** A master process serves `MasterService` on :7000;
+three worker processes serve `WorkerService` and `DataTransportService` on separate ports and
+register in etcd under a TTL lease. Records cross process boundaries over gRPC with credit-based
+flow control. What is still missing from the diagram is everything downstream of a checkpoint:
+MinIO, the Iceberg warehouse, and the coordinator that would write to them.
+
+`LocalJobExecutor` remains, and is still the right tool for tests and demos -- a determinism test
+comparing two runs of one fixture does not get more convincing by involving three processes.
+
+The LMS job as Phase 2 actually schedules it. `clicks` and `drop-bots` fuse into one chain, so
+the job is two chain groups and six vertical slices:
 
 ```
-              +------------------------------------------+
-              |            One JVM (lms-job)             |
-+---------+   |  +--------+    +-----------+   +-------+ |
-|  Kafka  |-->|  | clicks | -> | drop-bots |-->|console| |
-| 4 parts |   |  |  x4    |    |    x4     |   |  x2   | |
-+---------+   |  +--------+    +-----------+   +-------+ |
-              |        FORWARD          REBALANCE        |
-              +------------------------------------------+
+                          +------------------ etcd ------------------+
+                          |  /jobs/{id}/graph /state /assignments    |
+                          |  /workers/{id}   (TTL lease)             |
+                          +------------------------------------------+
+                               ^                        ^
+                        submit |                        | register + watch
+                               |                        |
+   JobClient --SubmitJob--> master :7000 --DeployTask--> workers
+                                  <--heartbeat (1s)----
+
+   worker-1            worker-2                worker-3
+   +-------------+     +-------------------+   +-------------------+
+   | clicks:0    |     | clicks:1          |   | clicks:2          |
+   | clicks:3    |     | console:0         |   | console:1         |
+   +-------------+     +-------------------+   +-------------------+
+          |                    ^                        ^
+          +--- gRPC records, credit-based ---------------+
+
+   Kafka (4 partitions) feeds every clicks subtask.
+   clicks -> drop-bots is FORWARD and chained: one thread, a method call, no serialization.
+   drop-bots -> console is REBALANCE: round-robin, across the network.
 ```
 
 ---
@@ -66,15 +87,24 @@ queues between them. Kafka is real; everything else in the diagram arrives later
 | `StateBackend` / `ValueState` / `ListState` | engine-api | Keyed state, narrow enough that heap and RocksDB are interchangeable | 1 (interfaces) |
 | `OperatorTask` | engine-runtime | The run loop. Switches over all three element kinds; watermark and barrier branches stubbed | 1 |
 | `SourceTask` | engine-runtime | Polls a source. Pull-based, which is what makes backpressure reach the broker | 1 |
-| `LocalOutput` | engine-runtime | Routes records by exchange strategy; broadcasts control elements down the channels it actually feeds | 1 |
+| `ResultPartitionWriter` | engine-runtime | Routes records by exchange strategy; broadcasts control elements down the channels it actually feeds | 1 |
+| `InputGate` | engine-runtime | One bounded queue per input channel. Reports which channel an element came from, and can block one without blocking the task | 2 |
+| `OperatorChain` | engine-runtime | Fuses adjacent operators into one thread, exchanging records by method call | 2 |
+| `UserCodeClassLoader` | engine-runtime | Loads the job classes the engine was never compiled against | 2 |
 | `TaskInstances` | engine-runtime | Gives each subtask a private copy of its operator, by serialization | 1 |
 | `LocalJobExecutor` | engine-runtime | Single-JVM execution: a thread and a bounded queue per subtask | 1 |
 | `KafkaSource` | engine-connectors | Reads JSON from Kafka. Phase 1 lets Kafka own offsets; Phase 4 takes them back | 1 |
 | `ConsoleSink` | engine-connectors | Prints. An `Operator<T, Void>` — sinks are not a separate concept | 1 |
-| `JobMaster` / `Scheduler` | engine-master | Compiles the physical graph, assigns tasks, owns the job state machine | 2 |
+| `JobMaster` | engine-master | Owns the job state machine; persists every transition before acting on it | 2 |
 | `ExecutionGraph` compiler | engine-master | Expands operators to subtasks, builds chain groups, assigns round-robin | 2 |
-| `EtcdMetadataStore` | engine-master | Durable job graph, assignments, checkpoint pointers | 2 |
-| `RecordTransport` | engine-runtime | Serialization, gRPC streaming, credit-based flow control | 2 |
+| `EtcdMetadataStore` | engine-metadata | Durable job graph, assignments, checkpoint pointers; worker registry under a TTL lease | 2 |
+| `ChainBuilder` | engine-master | The four conditions for fusing two operators | 2 |
+| `GrpcTaskDeployer` | engine-master | Sends tasks to workers, sinks first, so nothing sends to a task that does not exist | 2 |
+| `JobClient` | engine-master | Serializes a graph and submits it to the master | 2 |
+| `DataTransportService` / `Client` | engine-runtime | gRPC record streams, batching, credit-based flow control | 2 |
+| `StreamElementSerializer` | engine-runtime | The wire format: a tag byte plus payload | 2 |
+| `TaskManager` | engine-worker | Turns a `TaskDeployment` into running threads | 2 |
+| `HeartbeatClient` | engine-worker | Beats to the master and receives commands on the same stream | 2 |
 | `TaskTracker` | engine-master | Heartbeats; a worker is dead after three missed beats | 2 |
 | `WatermarkTracker` | engine-runtime | Per-channel watermarks, minimum across non-idle channels | 3 |
 | `BoundedOutOfOrdernessGenerator` | engine-runtime | Watermark generation with idleness detection | 3 |
@@ -114,6 +144,23 @@ through the fluent API at all, so the cycle test assembles node records directly
 Materialising it would mean a thread that only rehashes. The user's name for it is carried on
 the edge so logs and metrics can use it.
 
+**A slot is one vertical pipeline slice.** Scheduling assigns subtask *i* of every operator in a
+chain group together, not whole chain groups. Assigning whole groups would cap a job's spread at
+its number of chain groups however parallel its operators were -- the LMS job has two, so on
+three workers one would always sit idle. See CLAUDE.md section 4.2.
+
+**Deployment runs backwards.** Sinks are deployed first and sources last, because a task starts
+running the instant it is deployed. Deploying forwards means a source producing records before
+the filter behind it exists, and those records are dropped silently and only sometimes.
+
+**Credit is per channel, not per connection.** TCP applies backpressure, but one connection
+carries several logical channels, so a single slow subtask would stall its siblings. Credit moves
+the decision to the only place that can make it correctly. It also keeps data out of socket
+buffers, which from Phase 4 bounds how long barrier alignment can take.
+
+**Long-lived streams are opened under `Context.ROOT`.** A gRPC client call started inside a
+server handler inherits that handler's Context, which is cancelled when the handler returns.
+
 **Exchange strategy belongs to a node's input, not its output.** One operator feeding two
 downstreams may be routed two different ways. Attaching the strategy to the consumer keeps that
 expressible.
@@ -134,3 +181,6 @@ narrower sink an error; downgrading is safe because a forward edge is never keye
 | Linear fluent chain (§5.4) | Typed stream handles | A single chain cannot name the two inputs of Phase 5's interval join |
 | Window DSL (§5.4) | Operator manages its own session state (§9.3) | The PDF contradicts itself; §9.3 is what CLAUDE.md Phase 3 mandates, and it shows the mechanism |
 | Job state machine diagram (§8.2) | Phase 2 fails the job; Phase 4 adds `RESTARTING` | The PDF's diagram has its phase annotations transposed |
+| Scheduling: "round-robin subtasks" vs "chained groups land together" (§8.1) | A slot is one vertical slice | The two halves of the PDF's sentence contradict each other; its prose says vertical slices, its snippet says whole groups. See CLAUDE.md section 4.2 |
+| Six modules | Eight | `engine-rpc` and `engine-metadata` hold contracts both ends of the control plane need. See CLAUDE.md section 3 |
+| `Optional` fields on graph nodes | Nullable components, `Optional` accessors | `java.util.Optional` is deliberately not serializable, and the graph is written to etcd |

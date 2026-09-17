@@ -9,6 +9,12 @@ slf4j    = "2.0.16"
 logback  = "1.5.12"
 kafka    = "3.9.0"
 jackson  = "2.18.2"
+grpc     = "1.84.0"
+protobuf = "4.36.1"
+jetcd    = "0.8.7"
+protobufPlugin = "0.10.0"
+testcontainers = "1.20.4"
+awaitility = "4.3.0"
 
 [libraries]
 junit-bom      = { module = "org.junit:junit-bom",                version.ref = "junit" }
@@ -19,3 +25,24 @@ slf4j-api      = { module = "org.slf4j:slf4j-api",                version.ref = 
 logback        = { module = "ch.qos.logback:logback-classic",     version.ref = "logback" }
 kafka-clients  = { module = "org.apache.kafka:kafka-clients",     version.ref = "kafka" }
 jackson        = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
+
+# gRPC and protobuf. Phase 2 moves records and control messages between processes.
+grpc-protobuf      = { module = "io.grpc:grpc-protobuf",      version.ref = "grpc" }
+grpc-stub          = { module = "io.grpc:grpc-stub",          version.ref = "grpc" }
+grpc-netty-shaded  = { module = "io.grpc:grpc-netty-shaded",  version.ref = "grpc" }
+grpc-services      = { module = "io.grpc:grpc-services",      version.ref = "grpc" }
+protobuf-java      = { module = "com.google.protobuf:protobuf-java", version.ref = "protobuf" }
+# javax.annotation.Generated, which protoc-gen-grpc-java emits references to.
+annotations-api    = { module = "org.apache.tomcat:annotations-api", version = "6.0.53" }
+
+# etcd: durable home for the job graph, task assignments and checkpoint pointers.
+jetcd              = { module = "io.etcd:jetcd-core",         version.ref = "jetcd" }
+
+testcontainers     = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
+testcontainers-junit = { module = "org.testcontainers:junit-jupiter", version.ref = "testcontainers" }
+testcontainers-kafka = { module = "org.testcontainers:kafka",  version.ref = "testcontainers" }
+# Polling with a deadline, for tests of things that become true rather than are true.
+awaitility         = { module = "org.awaitility:awaitility",   version.ref = "awaitility" }
+
+[plugins]
+protobuf = { id = "com.google.protobuf", version.ref = "protobufPlugin" }
