@@ -304,6 +304,22 @@ The four demos (PDF §13.2): worker dies mid-window; master dies; late event; ho
 
 ---
 
+## 7.1 The bug log
+
+`docs/BUG-LOG.md` records every bug found while building the engine, and every review note — a
+thing noticed in passing that is not a bug yet but should be looked at.
+
+**Add an entry whenever a bug is found by running the engine rather than by a test failing.**
+That distinction is the point: a bug the tests did not catch is evidence about what the design
+lets you get wrong, and most of them so far have produced no error at all. Keep the format —
+what happened, why it was hard to see, the rule that prevents it, where the fix and its test
+live — and keep the line references accurate.
+
+The log is reviewed in one pass rather than entry by entry, so entries stay put once written.
+Do not delete a fixed bug; the record of it is what makes it useful.
+
+---
+
 ## 8. Documentation to produce alongside the code
 
 - `README.md` — what this is, its relationship to the article, quickstart, the four demos, and an explicit "known limitations" section mirroring PDF §15. Link the article.

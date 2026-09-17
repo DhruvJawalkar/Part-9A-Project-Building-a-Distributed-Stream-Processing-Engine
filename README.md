@@ -12,6 +12,8 @@ on its own before the next is added.
 The design rationale, interfaces and algorithm sketches live in
 [`docs/Part9A_Project_Companion.pdf`](docs/Part9A_Project_Companion.pdf).
 [`CLAUDE.md`](CLAUDE.md) is the authoritative build instruction.
+[`docs/BUG-LOG.md`](docs/BUG-LOG.md) records every bug found while building this, and why most of
+them produced no error at all.
 
 ## The one rule
 
@@ -135,7 +137,8 @@ rule working. (This is an amendment to the original "engine-api only" rule; see 
 
 ### Two bugs worth knowing about
 
-Both were found by running the thing, and both are pinned by tests.
+Both were found by running the thing, and both are pinned by tests. Full write-ups, along with
+everything found in later phases, are in [`docs/BUG-LOG.md`](docs/BUG-LOG.md).
 
 **Every subtask needs its own operator instance.** A job graph holds one operator object. Run
 it four ways and four threads share it — which, when the operator is a `KafkaSource`, means
@@ -178,7 +181,9 @@ Worker logs land in `demos/logs/`. The job compiles to **6 tasks across all 3 wo
 
 ### Four bugs worth knowing about
 
-All four were found by running the cluster, and all four are now pinned by tests.
+All four were found by running the cluster, and all four are now pinned by tests. Three of them
+produced no error at all -- see [`docs/BUG-LOG.md`](docs/BUG-LOG.md) for the full write-ups and
+for why that pattern matters.
 
 **A credit deadlock that looked like nothing happening.** A sender starts at zero credit and
 waits for permission. The receiver granted credit only *after* receiving a buffer — so it was
