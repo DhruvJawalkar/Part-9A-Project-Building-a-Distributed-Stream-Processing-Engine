@@ -1,6 +1,7 @@
 package dev.dhruv.streaming.master.graph;
 
 import dev.dhruv.streaming.api.ExchangeStrategy;
+import dev.dhruv.streaming.api.CheckpointListener;
 import dev.dhruv.streaming.api.KeyedOperator;
 import dev.dhruv.streaming.api.graph.JobGraph;
 import dev.dhruv.streaming.api.graph.LogicalOperator;
@@ -117,6 +118,13 @@ public final class ChainBuilder {
             // OperatorChain intentionally has one shared context, so fusing across this
             // boundary would silently give neighbouring operators the keyed operator's state.
             // Keep it a task boundary until contexts are namespaced per chained operator.
+            return Optional.empty();
+        }
+        if (successor instanceof SinkNode sink
+                && sink.operator() instanceof CheckpointListener) {
+            // A transactional sink owns state at the task checkpoint boundary and waits there
+            // for the coordinator's completion signal. Keeping it out of a source-headed chain
+            // gives it an OperatorTask with an aligned barrier and a durable task envelope.
             return Optional.empty();
         }
         return Optional.of(successor);

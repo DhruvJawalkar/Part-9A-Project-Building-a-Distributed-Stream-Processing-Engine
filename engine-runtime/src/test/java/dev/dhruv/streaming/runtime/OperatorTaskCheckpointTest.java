@@ -1,6 +1,7 @@
 package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.CheckpointBarrier;
+import dev.dhruv.streaming.api.CheckpointListener;
 import dev.dhruv.streaming.api.Collector;
 import dev.dhruv.streaming.api.Either;
 import dev.dhruv.streaming.api.IntervalJoinOperator;
@@ -26,6 +27,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -191,13 +193,44 @@ class OperatorTaskCheckpointTest {
         awaitBlockedChannels(gate, 1);
 
         task.abortCheckpoint(1);
-        assertThat(gate.blockedChannelCount()).isZero();
+        awaitBlockedChannels(gate, 0);
         gate.enqueue(0, new CheckpointBarrier(2, 2));
         gate.enqueue(1, new CheckpointBarrier(2, 2));
 
         assertThat(secondCheckpoint.await(2, TimeUnit.SECONDS)).isTrue();
         gate.enqueue(0, Watermark.MAX);
         gate.enqueue(1, Watermark.MAX);
+        thread.join(2_000);
+        assertThat(thread.isAlive()).isFalse();
+    }
+
+    @Test
+    void coordinatorAbortFencesABarrierThatArrivesLater() throws Exception {
+        InputGate gate = new InputGate(1);
+        LifecycleOperator operator = new LifecycleOperator();
+        OperatorTask task = new OperatorTask("sink#0", operator, gate, new RecordingOutput(),
+                Optional.empty(), new InMemoryStateBackend(),
+                temporaryDirectory.resolve("abort-before-barrier"),
+                new TaskMetricGroup("sink", 0));
+        CountDownLatch nextCheckpoint = new CountDownLatch(1);
+        task.onCheckpoint(result -> {
+            if (result.checkpointId() == 2) {
+                nextCheckpoint.countDown();
+            }
+        });
+
+        Thread thread = new Thread(task, "abort-before-barrier");
+        thread.start();
+        task.abortCheckpoint(1);
+        awaitValue(operator.aborted, 1);
+
+        gate.enqueue(0, new CheckpointBarrier(1, 1));
+        gate.enqueue(0, new CheckpointBarrier(2, 2));
+
+        assertThat(nextCheckpoint.await(2, TimeUnit.SECONDS)).isTrue();
+        assertThat(operator.preCommitted).containsExactly(2L);
+        task.abortCheckpoint(2);
+        gate.enqueue(0, Watermark.MAX);
         thread.join(2_000);
         assertThat(thread.isAlive()).isFalse();
     }
@@ -245,6 +278,59 @@ class OperatorTaskCheckpointTest {
         assertThat(thread.isAlive()).isFalse();
     }
 
+    @Test
+    void persistsTransactionalStateAndRunsCompletionAndAbortOnTheTaskThread() throws Exception {
+        InputGate firstGate = new InputGate(1);
+        LifecycleOperator firstOperator = new LifecycleOperator();
+        OperatorTask first = new OperatorTask("sink#0", firstOperator, firstGate,
+                new RecordingOutput(), Optional.empty(), new InMemoryStateBackend(),
+                temporaryDirectory.resolve("first-transaction"), new TaskMetricGroup("sink", 0));
+        java.util.concurrent.atomic.AtomicReference<OperatorTask.CheckpointResult> checkpoint =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        CountDownLatch snapshotted = new CountDownLatch(1);
+        first.onCheckpoint(result -> {
+            checkpoint.set(result);
+            snapshotted.countDown();
+        });
+
+        Thread firstThread = new Thread(first, "transactional-sink-first");
+        firstThread.start();
+        firstGate.enqueue(0, new CheckpointBarrier(7, 7));
+        assertThat(snapshotted.await(2, TimeUnit.SECONDS)).isTrue();
+        assertThat(firstOperator.preCommitted).containsExactly(7L);
+
+        // The coordinator is allowed to replay this RPC. The sink keeps the external effect
+        // idempotent, while the runtime still delivers both messages on its task thread.
+        first.notifyCheckpointComplete(7);
+        first.notifyCheckpointComplete(7);
+        first.abortCheckpoint(8);
+        awaitValue(firstOperator.committed, 1);
+        awaitValue(firstOperator.aborted, 1);
+        assertThat(firstOperator.completionCalls.get()).isEqualTo(2);
+        assertThat(firstOperator.callbackThreads).allMatch("transactional-sink-first"::equals);
+        first.cancel();
+        firstThread.join(2_000);
+
+        InputGate restoredGate = new InputGate(1);
+        LifecycleOperator restoredOperator = new LifecycleOperator();
+        OperatorTask restored = new OperatorTask("sink#0", restoredOperator, restoredGate,
+                new RecordingOutput(), Optional.empty(), new InMemoryStateBackend(),
+                temporaryDirectory.resolve("restored-transaction"), new TaskMetricGroup("sink", 0));
+        restored.restore(checkpoint.get().stateHandle());
+        Thread restoredThread = new Thread(restored, "transactional-sink-restored");
+        restoredThread.start();
+        awaitValue(restoredOperator.restored, 1);
+        assertThat(restoredOperator.pendingCheckpoint).isEqualTo(7L);
+
+        restored.notifyCheckpointComplete(7);
+        restored.notifyCheckpointComplete(7);
+        awaitValue(restoredOperator.committed, 1);
+        assertThat(restoredOperator.completionCalls.get()).isEqualTo(2);
+        assertThat(restoredOperator.callbackThreads).allMatch("transactional-sink-restored"::equals);
+        restored.cancel();
+        restoredThread.join(2_000);
+    }
+
     private static void awaitContains(List<String> values, String expected)
             throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
@@ -276,6 +362,14 @@ class OperatorTaskCheckpointTest {
             Thread.sleep(10);
         }
         assertThat(metrics.snapshot()).containsEntry(name, expected);
+    }
+
+    private static void awaitValue(AtomicInteger value, int expected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (value.get() != expected && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(value).hasValue(expected);
     }
 
     private static IntervalJoinOperator<String, String, String, String> stringJoin() {
@@ -315,6 +409,52 @@ class OperatorTaskCheckpointTest {
         public void onEventTimer(long timestamp, String key, Collector<String> out)
                 throws Exception {
             TIMER_RESULTS.add(key + ":" + state.value().orElseThrow());
+        }
+    }
+
+    private static final class LifecycleOperator implements Operator<String, String>, CheckpointListener {
+        private final List<Long> preCommitted = new CopyOnWriteArrayList<>();
+        private final AtomicInteger completionCalls = new AtomicInteger();
+        private final AtomicInteger committed = new AtomicInteger();
+        private final AtomicInteger aborted = new AtomicInteger();
+        private final AtomicInteger restored = new AtomicInteger();
+        private final List<String> callbackThreads = new CopyOnWriteArrayList<>();
+        private Long pendingCheckpoint;
+
+        @Override
+        public void processElement(StreamRecord<String> record, Collector<String> out) {
+        }
+
+        @Override
+        public java.io.Serializable preCommit(long checkpointId) {
+            preCommitted.add(checkpointId);
+            pendingCheckpoint = checkpointId;
+            return new PendingCheckpoint(checkpointId);
+        }
+
+        @Override
+        public void restoreCheckpointState(java.io.Serializable checkpointState) {
+            pendingCheckpoint = ((PendingCheckpoint) checkpointState).checkpointId();
+            restored.incrementAndGet();
+        }
+
+        @Override
+        public void notifyCheckpointComplete(long checkpointId) {
+            callbackThreads.add(Thread.currentThread().getName());
+            completionCalls.incrementAndGet();
+            if (pendingCheckpoint != null && pendingCheckpoint == checkpointId) {
+                pendingCheckpoint = null;
+                committed.incrementAndGet();
+            }
+        }
+
+        @Override
+        public void notifyCheckpointAborted(long checkpointId) {
+            callbackThreads.add(Thread.currentThread().getName());
+            aborted.incrementAndGet();
+        }
+
+        private record PendingCheckpoint(long checkpointId) implements java.io.Serializable {
         }
     }
 

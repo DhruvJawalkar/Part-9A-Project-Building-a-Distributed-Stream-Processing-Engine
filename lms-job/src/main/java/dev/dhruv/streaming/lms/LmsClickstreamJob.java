@@ -6,7 +6,6 @@ import dev.dhruv.streaming.api.JobExecutor;
 import dev.dhruv.streaming.api.JobExecutors;
 import dev.dhruv.streaming.api.graph.DataStream;
 import dev.dhruv.streaming.api.graph.JobGraph;
-import dev.dhruv.streaming.connectors.console.ConsoleSink;
 import dev.dhruv.streaming.connectors.kafka.KafkaSource;
 
 import java.time.Duration;
@@ -16,8 +15,8 @@ import java.time.Duration;
  *
  * <p>The graph reads clicks and borrows from Kafka. Clean clicks fan out: one branch builds
  * member sessions, while RESULT_CLICK records on the other are tagged and interval-joined
- * with tagged borrows by member and catalog item. Both outputs remain console sinks until
- * Phase 6 replaces them with checkpoint-transactional Iceberg sinks.
+ * with tagged borrows by member and catalog item. Both outputs are checkpoint-transactional
+ * Iceberg sinks, so an interval becomes visible only after its checkpoint completes.
  *
  * <p>What this class deliberately cannot do is reach into the engine. It compiles against the
  * API and the connectors and nothing else, so every capability it uses has to have been
@@ -99,8 +98,9 @@ public final class LmsClickstreamJob {
                 .keyBy("by-member", ClickEvent::memberId)
                 .process("sessions", new SessionAggregator())
                 .parallelism(4)
-                .sink("console", new ConsoleSink<SessionRow>("session | "))
-                .parallelism(2);
+                .sink("browse-sessions", LmsIcebergOutputs.browseSessionsSink())
+                // A single writer gives each table one atomic interval append.
+                .parallelism(1);
 
         DataStream<Either<ClickEvent, BorrowEvent>> clickJoinInput = cleanClicks
                 .filter("result-clicks", ClickEvent::isResultClick)
@@ -122,8 +122,9 @@ public final class LmsClickstreamJob {
                         BorrowEvent, ConversionRow>(Duration.ZERO, CONVERSION_INTERVAL,
                         ConversionRow::from))
                 .parallelism(4)
-                .sink("conversion-console", new ConsoleSink<ConversionRow>("conversion | "))
-                .parallelism(2);
+                .sink("click-conversions", LmsIcebergOutputs.clickConversionsSink())
+                // Keep a checkpoint interval as one table append, rather than per-subtask files.
+                .parallelism(1);
 
         return job.build();
     }

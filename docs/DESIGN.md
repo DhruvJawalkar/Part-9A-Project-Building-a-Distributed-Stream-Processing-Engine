@@ -1,8 +1,8 @@
 # Engine design
 
-This living design document records what is implemented through **Phase 5** and labels later
-work as **planned**. This is a teaching engine: its source shows the mechanism directly instead
-of hiding it behind a production framework.
+This living design document records what is implemented through **Phase 6** and labels only the
+remaining **Phase 7** work as planned. This is a teaching engine: its source shows the mechanism
+directly instead of hiding it behind a production framework.
 
 The companion rationale is in [Part9A_Project_Companion.pdf](Part9A_Project_Companion.pdf); the
 authoritative build sequence is in [CLAUDE.md](../CLAUDE.md).
@@ -16,7 +16,7 @@ authoritative build sequence is in [CLAUDE.md](../CLAUDE.md).
 | 3 | Complete | Event time, watermarks/idleness, keyed state/timers and sessions |
 | 4 | Complete | Aligned checkpoints, RocksDB state, MinIO archives and whole-job recovery |
 | 5 | Complete | Tagged two-stream interval join and LMS conversion branch |
-| 6 | **Planned** | Transactional Iceberg output |
+| 6 | Complete | Checkpoint-transactional Iceberg output, REST catalog and MinIO demo setup |
 | 7 | **Planned** | Status API, dashboard and reproducible demos |
 
 ## Core rules
@@ -42,14 +42,14 @@ describe how a consumer receives input. Validation rejects cycles, unreachable o
 non-positive parallelism.
 
 ```text
-clicks -> drop-bots --+-- HASH by memberId -> sessions -> session console
+clicks -> drop-bots --+-- HASH by memberId -> sessions -> browse_sessions Iceberg sink
                       |
                       +-- result-clicks -> tag-left --+
                                                      +-- REBALANCE union
 borrows ---------------------------> tag-right ------+       |
                                                              +-- HASH by ConversionKey
                                                              +-- IntervalJoinOperator
-                                                             +-- conversion console
+                                                             +-- click_conversions Iceberg sink
 ```
 
 `keyBy` does not create a node. It records a `KeySelector` and partition name on the next input
@@ -242,7 +242,10 @@ workers so any channels held by that incomplete alignment are released.
 
 Each worker first writes the task snapshot to local files. `RocksDbStateBackend` snapshots its
 database; the task envelope records its state handle together with pending timer data and event-time
-progress. Sources add connector position and watermark-generator state. `KafkaSource` assigns
+progress. An operator implementing `CheckpointListener` also runs `preCommit` on its task thread
+after barrier alignment and before this snapshot; its serializable return value is stored in the
+same envelope. On restore, the operator is opened first and then receives that operator-owned
+state. Sources add connector position and watermark-generator state. `KafkaSource` assigns
 partitions explicitly and snapshots the next offsets without committing them to Kafka. On restore,
 the new source seeks to the checkpointed offsets before polling resumes.
 
@@ -255,15 +258,21 @@ its own checkpoint directory. A filesystem archive implementation supports tests
 The coordinator expects one acknowledgement per chain-group subtask. An acknowledgement carries a
 state handle, alignment time and state size. Only when every expected task has acknowledged does
 the coordinator persist the completed checkpoint pointer and all task handles to etcd; only after
-that durable write does it send the completion notification. Incomplete timed-out checkpoints are
-aborted and never become recovery points.
+that durable write does it send the completion notification. Workers queue completion and abort
+callbacks onto each operator task's run loop, preserving the single-threaded operator contract.
+Incomplete timed-out checkpoints are aborted and never become recovery points.
 
-On worker failure, the job moves to `FAILING`, all tasks are cancelled, and the master loads the
-latest completed checkpoint. It then moves to `RESTARTING`, waits the fixed delay, and redeploys the
-entire graph with each task's corresponding handle. The default policy permits three attempts,
-one second apart; without a completed checkpoint or after attempts are exhausted, the job becomes
-`FAILED`. Workers declared dead are quarantined from scheduling while their etcd lease may still
-exist. Fresh registration makes a worker eligible again.
+On worker failure or recovery of a job that had been `RUNNING` when its master stopped, the job
+moves to `FAILING`, all tasks are cancelled, and the master loads the latest completed checkpoint.
+It then moves to `RESTARTING`, waits the fixed delay, and redeploys the
+entire graph with each task's corresponding handle. After restore, it replays the completion
+notification for the durable checkpoint: a master can fail after a sink commit and before its
+completion RPC has been observed, so transactional sinks must make this callback idempotent. The
+whole-job rewind on master recovery also prevents reuse of an in-memory, in-flight checkpoint id.
+The default policy permits three attempts, one second apart; without a completed checkpoint or after
+attempts are exhausted, the job becomes `FAILED`. Workers declared dead are quarantined from
+scheduling while their etcd lease may still exist. Fresh registration makes a worker eligible
+again.
 
 Workers reopen their heartbeat stream after a master interruption. The first beat seeds the new
 master's in-memory failure detector, while etcd supplies the durable worker addresses and recovered
@@ -291,6 +300,53 @@ processes. The separate `SessionPipelineRecoveryAcceptanceTest` compares the rec
 source/session/sink pipeline with a clean fixed replay, while the MinIO integration test deletes
 the producer-side checkpoint directory before restoring the archive on a different filesystem root.
 
+## Phase 6 transactional Iceberg output
+
+`IcebergSink<T>` is an `Operator<T, Void>` plus `CheckpointListener`. It currently accepts only
+unpartitioned tables and validates that constraint in `open()`. The sink opens one Parquet writer
+for the current checkpoint interval. `preCommit(checkpointId)` closes that writer, records its
+path, byte size and row count in serializable pending-file state, stores that state in the task
+envelope, and opens the next writer. Writing a Parquet object is not an Iceberg commit: rows remain
+invisible to table scans until completion.
+
+After the master has durably persisted the completed-checkpoint pointer, the worker queues
+`notifyCheckpointComplete` on the sink task thread. The sink refreshes the current table, scans
+reachable data-file paths, and appends only pending paths that are missing, in one Iceberg metadata
+commit. This current-table path check handles a crash after a successful append but before the
+completion RPC is observed, making completion replay idempotent. `notifyCheckpointAborted` drops
+the pending metadata; any already-written Parquet object is an expected orphan, absent from every
+reachable snapshot and therefore not a visible row.
+
+The LMS job constructs exactly one sink subtask per output table. The singleton sinks write
+`lms.analytics.browse_sessions` and `lms.analytics.click_conversions`, respectively, so one
+checkpoint interval is one atomic table append rather than one file per parallel sink subtask.
+`LmsIcebergOutputs` keeps the job serializable: the submitter reads environment-backed settings
+into the graph, and workers use those serialized values to create the REST catalog and S3 file IO.
+The default local setup is the Iceberg REST fixture at
+`http://localhost:8181`, backed by MinIO at `http://localhost:9000`; inside Compose the catalog
+uses `http://minio:9000`. `demos/iceberg/init-schema.sh` creates `lms.analytics` and both tables
+idempotently after `docker compose up -d`, and `demos/run-cluster.sh` repeats that bootstrap.
+
+### Phase 6 acceptance evidence
+
+`IcebergSinkAcceptanceTest` uses Iceberg's in-memory catalog and local file IO to prove row
+invisibility before completion, idempotent completion replay, and simulated lost-sink replay. A
+sink that closes a pending file and is replaced before completion leaves the object in storage but
+outside every Iceberg snapshot; restored state writes a replacement file and each logical row
+appears once. The deterministic six-event cadence figures are:
+
+| Checkpoint cadence | First visible row | Data files | Snapshots | Rows |
+|---|---:|---:|---:|---:|
+| Short | 100 ms | 3 | 3 | 6 |
+| Long | 500 ms | 1 | 1 | 6 |
+
+The trade-off is earlier visibility versus more small files. Partitioned Iceberg tables are a
+deliberate Phase 6 limitation; the sink fails explicitly instead of constructing incorrect
+partition metadata. Compose supplies an executable REST/MinIO demo surface, but the automated
+acceptance test does not claim process-level REST/S3 or worker-kill coverage. The opt-in
+`IcebergRestMinioSmokeTest` separately verifies the real REST catalog, `S3FileIO`, MinIO write and
+checkpoint-completion path.
+
 ## Connectors
 
 - **KafkaSource (implemented):** pull-based LMS input with explicit partition assignment and
@@ -298,8 +354,9 @@ the producer-side checkpoint directory before restoring the archive on a differe
   not the recovery position.
 - **ConsoleSink (implemented):** a normal `Operator<T, Void>` for visible output.
 - **FileReplaySource (implemented):** bounded fixture source for deterministic tests/demos.
-- **IcebergSink (planned, Phase 6):** will pre-commit files into state and atomically append them
-  after a completed checkpoint. Its commit must be idempotent after a crash.
+- **IcebergSink (implemented, Phase 6):** pre-commits one interval's files into task state and
+  atomically appends missing paths after a completed checkpoint. Its current-table path check makes
+  completion replay idempotent; aborted or lost intervals leave unreachable object-store orphans.
 
 ## Observability
 
@@ -315,7 +372,9 @@ worker loss mid-window, master loss, a late event and a hot key.
 ## Deliberate limitations
 
 There is one master, fixed parallelism, no savepoints, no dynamic rescaling, no SQL layer, and no
-security/multi-tenancy/resource isolation. Checkpoint recovery and interval joining are
-implemented, but the console sinks are not transactional; exactly-once external output awaits the
-Phase 6 Iceberg commit protocol. Operational APIs remain planned. These omissions are visible so
-the code shows which production-system mechanism solves each problem.
+security/multi-tenancy/resource isolation. Checkpoint recovery, interval joining and transactional
+output for completed checkpoint intervals in unpartitioned Iceberg tables are implemented.
+Non-transactional console sinks remain at-least-once. Bounded sources do not yet coordinate a
+terminal checkpoint, so their post-last-barrier transactional output is deliberately not claimed;
+the LMS production topology uses unbounded Kafka sources. Operational APIs remain planned. These omissions are visible so the code shows
+which production-system mechanism solves each problem.

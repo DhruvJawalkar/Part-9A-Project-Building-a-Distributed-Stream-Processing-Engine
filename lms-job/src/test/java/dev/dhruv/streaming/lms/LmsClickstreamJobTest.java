@@ -3,9 +3,9 @@ package dev.dhruv.streaming.lms;
 import dev.dhruv.streaming.api.ExchangeStrategy;
 import dev.dhruv.streaming.api.graph.JobGraph;
 import dev.dhruv.streaming.api.graph.LogicalOperator;
-import dev.dhruv.streaming.api.graph.SinkNode;
 import dev.dhruv.streaming.api.graph.SourceNode;
 import dev.dhruv.streaming.api.graph.TransformNode;
+import dev.dhruv.streaming.connectors.iceberg.IcebergSink;
 import dev.dhruv.streaming.runtime.SerializationUtil;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -31,13 +31,13 @@ class LmsClickstreamJobTest {
 
         assertThat(graph.name()).isEqualTo("lms-clickstream");
         assertThat(graph.operators()).extracting(LogicalOperator::id)
-                .containsExactly("clicks", "borrows", "drop-bots", "sessions", "console",
+                .containsExactly("clicks", "borrows", "drop-bots", "sessions", "browse-sessions",
                         "result-clicks", "tag-result-clicks", "tag-borrows",
-                        "conversion-inputs", "conversions", "conversion-console");
+                        "conversion-inputs", "conversions", "click-conversions");
         assertThat(graph.sources()).extracting(LogicalOperator::id)
                 .containsExactly("clicks", "borrows");
         assertThat(graph.sinks()).extracting(LogicalOperator::id)
-                .containsExactly("console", "conversion-console");
+                .containsExactly("browse-sessions", "click-conversions");
     }
 
     @Test
@@ -71,14 +71,15 @@ class LmsClickstreamJobTest {
     }
 
     @Test
-    @DisplayName("narrows into the sink by rebalance rather than forward")
-    void sinkNarrowsByRebalance() {
-        // Four session subtasks into two sink subtasks. A forward edge would leave session
-        // subtasks 2 and 3 with nowhere to send, so the builder downgrades the edge.
-        SinkNode console = LmsClickstreamJob.buildGraph().sinks().getFirst();
+    @DisplayName("uses one transactional Iceberg writer for each table")
+    void icebergSinksAreSingletonsReachedByRebalance() {
+        var sinks = LmsClickstreamJob.buildGraph().sinks();
 
-        assertThat(console.parallelism()).isEqualTo(2);
-        assertThat(console.inputExchange()).isEqualTo(ExchangeStrategy.REBALANCE);
+        assertThat(sinks).allSatisfy(sink -> {
+            assertThat(sink.parallelism()).isEqualTo(1);
+            assertThat(sink.inputExchange()).isEqualTo(ExchangeStrategy.REBALANCE);
+            assertThat(sink.operator()).isInstanceOf(IcebergSink.class);
+        });
     }
 
     @Test

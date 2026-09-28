@@ -108,6 +108,48 @@ services:
     volumes:
       - minio-data:/data
 
+  # Creates the buckets used by checkpoint archives and the Iceberg warehouse. Keeping this as
+  # a one-shot service makes `docker compose down -v` a complete reset while allowing the REST
+  # catalog and workers to use stable bucket names on every run.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: lms-minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        until mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1; do
+          sleep 1
+        done
+        mc mb --ignore-existing local/stream-checkpoints
+        mc mb --ignore-existing local/warehouse
+        echo "MinIO buckets ready: stream-checkpoints warehouse"
+
+  # Apache Iceberg's REST catalog stores table metadata in the MinIO warehouse. The engine
+  # workers run on the host in the demo, so they reach this service through localhost:8181;
+  # the catalog itself reaches MinIO through the Docker service name.
+  iceberg-rest:
+    # 1.11.0 has no published versioned fixture image yet. 1.10.1 is the newest stable tag
+    # compatible with the engine's 1.11 REST client; pinning it keeps the demo reproducible.
+    image: apache/iceberg-rest-fixture:1.10.1
+    container_name: lms-iceberg-rest
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8181:8181"
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+
 volumes:
   kafka-data:
   etcd-data:

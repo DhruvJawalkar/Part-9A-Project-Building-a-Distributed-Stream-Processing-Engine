@@ -1,7 +1,7 @@
 # Architecture
 
 Kept current as phases land. Components that do not exist yet are marked with the phase that
-adds them, so this file also serves as a map of what is coming.
+adds them, so this file also serves as a map of what remains.
 
 ---
 
@@ -38,7 +38,7 @@ The target shape, from §4.1 of the companion PDF:
                                                        +----------------+
 ```
 
-**As of Phase 4 the control, data and checkpoint paths are real.** A master process serves
+**As of Phase 6 the control, data, checkpoint and transactional-output paths are real.** A master process serves
 `MasterService` on :7000;
 three worker processes serve `WorkerService` and `DataTransportService` on separate ports and
 register in etcd under a TTL lease. Records cross process boundaries over gRPC with credit-based
@@ -46,8 +46,9 @@ flow control. Source tasks now generate event-time watermarks and in-band idle/a
 operator tasks advance their local clock from the minimum across active input channels. The master
 injects source barriers and receives task checkpoint acknowledgements. Workers archive full task
 snapshots in MinIO, while etcd stores the pointer and per-task handles only after the whole
-checkpoint completes. The Iceberg warehouse and transactional sink remain Phase 6 work; MinIO is
-currently used for checkpoint archives.
+checkpoint completes. The Iceberg REST catalog stores table metadata in the MinIO warehouse, and
+the LMS sinks publish completed checkpoint intervals to Iceberg only after that durable pointer
+write. `StatusApi` and the dashboard remain Phase 7 work.
 
 `LocalJobExecutor` remains, and is still the right tool for tests and demos -- a determinism test
 comparing two runs of one fixture does not get more convincing by involving three processes.
@@ -69,7 +70,7 @@ vertical slice across the registered workers:
    JobClient --SubmitJob--> master :7000 --DeployTask--> workers
                                   <--heartbeat (1s)----
 
-   Kafka clicks (4 partitions) -> drop-bots --+-- HASH(memberId) -> sessions -> session sink
+   Kafka clicks (4 partitions) -> drop-bots --+-- HASH(memberId) -> sessions -> browse_sessions sink (1)
                                                |
                                                +-> result-clicks -> tag-left --+
                                                                                 +-> union
@@ -77,7 +78,7 @@ vertical slice across the registered workers:
                                                                                    |
                                                                                    +-> HASH(ConversionKey)
                                                                                        -> interval join
-                                                                                       -> conversion sink
+                                                                                       -> click_conversions sink (1)
 
    Worker tasks exchange records over gRPC with credit-based flow control. Each producer edge
    retains its own exchange strategy; every union input subtask has a separate input-channel id.
@@ -153,7 +154,7 @@ KafkaSource -> source snapshot + barrier -> ordered record channels
                                               |
                                write completed pointer to etcd
                                               |
-                         notify completion / future sink commit
+                         notify completion / Iceberg sink commit
 ```
 
 For multi-input tasks, `BarrierAligner` blocks the channel that has delivered its barrier and keeps
@@ -164,10 +165,12 @@ downstream or entering the snapshot. If the coordinator times out, `AbortCheckpo
 channels held by the abandoned alignment.
 
 Each operator task stores keyed state in RocksDB. Its archive contains the RocksDB checkpoint and
-an envelope for pending timers and watermark progress. Each source archive contains connector
-position and watermark-generator progress. Kafka's manual partition assignment snapshots the next
-offset per partition without committing it to Kafka. Restore seeks to that position before source
-polling starts.
+an envelope for pending timers and watermark progress. An operator implementing
+`CheckpointListener` runs `preCommit` after alignment and before the snapshot; the serializable
+return value is persisted in that same task envelope and restored after `open()`. Each source
+archive contains connector position and watermark-generator progress. Kafka's manual partition
+assignment snapshots the next offset per partition without committing it to Kafka. Restore seeks
+to that position before source polling starts.
 
 Workers publish complete task directories through the `CheckpointStorage` interface. Production
 cluster configuration selects `MinioCheckpointStorage`; it uploads a ZIP to the configured bucket
@@ -176,15 +179,21 @@ restore, the assigned worker fetches and extracts the archive to its local check
 the handle independent of the original worker's disk. Tests can use the filesystem implementation.
 
 The coordinator holds acknowledgements in memory until every physical chain-group task reports a
-handle. Then it persists the complete set to etcd before notifying workers of completion. An
-incomplete checkpoint times out, is never selected for recovery, and sends an abort command. Worker
-heartbeats include per-task checkpoint id, duration, state bytes, and alignment milliseconds.
+handle. Then it persists the complete set and recovery pointer to etcd before notifying workers of
+completion. Completion and abort callbacks are queued onto the operator task's own run loop, not
+called from gRPC handler threads. An incomplete checkpoint times out, is never selected for
+recovery, and sends an abort command. Worker heartbeats include per-task checkpoint id, duration,
+state bytes, and alignment milliseconds.
 
-Recovery always rewinds the whole DAG. The master cancels and joins each running task, reads the
-latest completed pointer, then sends every task its matching state handle during redeployment. It
-quarantines a dead worker until a fresh registration, preventing recovery from assigning tasks to
-a stale etcd lease. The default restart policy waits one second and allows three attempts before
-marking the job failed.
+Recovery always rewinds the whole DAG after worker loss or master restart. The master cancels and
+joins each running task, reads the latest completed pointer, then sends every task its matching
+state handle during redeployment. The master-restart rewind fences any checkpoint id that existed
+only in the previous coordinator's memory. It
+replays the durable checkpoint's sink completion callback after restore; transactional sinks make
+this safe when a prior master died after committing but before observing the callback. It quarantines
+a dead worker until a fresh registration, preventing recovery from assigning tasks to a stale etcd
+lease. The default restart policy waits one second and allows three attempts before marking the job
+failed.
 
 Heartbeat clients reconnect after a master outage. A surviving worker's first beat seeds the
 replacement master's failure detector, and task-status samples repopulate its latest-status
@@ -211,6 +220,69 @@ The separate live Kafka run verifies recovery for the full 10-task LMS plan and 
 wiring. The fixed-replay `SessionPipelineRecoveryAcceptanceTest` and MinIO cross-filesystem test
 provide additional focused coverage, including restore after deleting the producer's local
 checkpoint directory.
+
+---
+
+## Phase 6 transactional Iceberg output
+
+The Iceberg path extends the task checkpoint envelope without adding a second sink protocol:
+
+```text
+aligned barrier
+      |
+      v
+IcebergSink.preCommit(checkpoint)
+      | closes writer for this interval
+      v
+task envelope: keyed state + timers + watermarks + pending file path/size/rows
+      |
+      v
+all task acks -> etcd durable completed pointer -> task-thread completion callback
+                                                               |
+                                                               v
+                                      refresh current table; append missing paths once
+```
+
+`IcebergSink` owns one Parquet writer per checkpoint interval. `preCommit` closes that writer,
+stores its path, size and row count in serializable pending-file state, and opens the next writer.
+The object is deliberately not visible to an Iceberg scan at this point. After the master has
+written the completed-checkpoint pointer and handles to etcd, the worker queues
+`notifyCheckpointComplete` on the sink's operator thread. The sink refreshes the table and scans
+reachable data-file paths before appending missing pending files in one metadata commit. This
+current-table path check makes callback replay idempotent after a crash between the table commit
+and the completion acknowledgement. Abort drops pending metadata; a file already in object
+storage remains an orphan outside every reachable snapshot and contributes no rows.
+
+The LMS graph uses singleton sink parallelism (one subtask per table), so each checkpoint interval
+is one append to the exact tables `lms.analytics.browse_sessions` and
+`lms.analytics.click_conversions`. `LmsIcebergOutputs` reads configuration in the submitter and
+passes serializable REST catalog settings; workers create the catalog and S3 file IO locally from
+those captured values. `docker compose up -d` starts Kafka, etcd, MinIO
+and `apache/iceberg-rest-fixture`. MinIO supplies `stream-checkpoints` and `warehouse` buckets;
+the REST catalog reaches it as `http://minio:9000`, while host-launched workers use
+`http://localhost:9000` and the catalog at `http://localhost:8181`.
+`demos/iceberg/init-schema.sh` idempotently creates namespace `lms.analytics` and both
+unpartitioned tables; `demos/run-cluster.sh` runs that bootstrap automatically as well.
+
+### Acceptance evidence
+
+`IcebergSinkAcceptanceTest` uses an in-memory Iceberg catalog and local file IO. It checks that rows
+remain invisible before completion, completion replay does not create a duplicate snapshot or row,
+and simulated lost-sink replay leaves the old closed file as an orphan while replacement output
+exposes each logical row once. The fixed six-event cadence evidence is:
+
+| Checkpoint cadence | First visible row | Data files | Snapshots | Rows |
+|---|---:|---:|---:|---:|
+| Short | 100 ms | 3 | 3 | 6 |
+| Long | 500 ms | 1 | 1 | 6 |
+
+The shorter cadence improves freshness but creates more small files. Partitioned Iceberg tables are
+not supported in Phase 6; the sink rejects them explicitly at open time. The REST/MinIO Compose
+surface is executable demo infrastructure. The opt-in `IcebergRestMinioSmokeTest` verifies its
+REST catalog, `S3FileIO`, MinIO write and completion path, but is not a process-kill test.
+The transaction guarantee covers completed checkpoint intervals. Bounded sources do not yet wait
+for a coordinator-owned terminal checkpoint, so their final post-barrier interval is a documented
+limitation; the LMS production sources are unbounded Kafka inputs.
 
 ---
 
@@ -262,14 +334,16 @@ remain in its buffer until that watermark passes their cleanup horizon, making t
 effect visible in the two gauges.
 
 The session branch remains keyed by `memberId`; the conversion branch is keyed by
-`ConversionKey(memberId, catalogItemId)`. The output remains console-based until Phase 6 adds the
-transactional Iceberg sink.
+`ConversionKey(memberId, catalogItemId)`. Both branches now terminate in singleton,
+checkpoint-transactional Iceberg sinks: `lms.analytics.browse_sessions` and
+`lms.analytics.click_conversions`.
 
 ## Component table
 
 | Component | Lives in | Responsibility | Phase |
 |---|---|---|---|
 | `StreamElement` / `StreamRecord` / `Watermark` / `CheckpointBarrier` | engine-api | The record envelope. A watermark carries active/idle status as well as a timestamp; control elements travel in band with data | 1–4 |
+| `CheckpointListener` | engine-api | Optional operator lifecycle: pre-commit state in the task envelope, restore it, and receive durable completion/abort callbacks | 6 |
 | `Operator` / `KeyedOperator` | engine-api | User logic. Single-threaded by contract; `Serializable` because it is shipped to a worker | 1 |
 | `JobGraph` + `DataStream` / `KeyedStream` | engine-api | The logical graph and the builder that produces it. Validated on construction, not in the builder | 1 |
 | `DataStream.union` | engine-api | Timestamp-preserving fan-in with `REBALANCE` edges and a multi-input boundary | 5 |
@@ -309,7 +383,7 @@ transactional Iceberg sink.
 | `CheckpointStorage` | engine-worker | Archives/materializes full task checkpoints; filesystem and MinIO implementations | 4 |
 | `RestartStrategy` | engine-master | Fixed-delay job-wide restart attempts | 4 |
 | `IntervalJoinOperator` | engine-api | Keyed, timestamp-bounded matching with separate left/right `ListState` and cleanup gauges | 5 |
-| `IcebergSink` | engine-connectors | Two-phase commit against an Iceberg table | 6 |
+| `IcebergSink` | engine-connectors | One Parquet writer per checkpoint interval; pending file state and idempotent current-table append for unpartitioned Iceberg tables | 6 |
 | `StatusApi` | engine-master | REST endpoints and Prometheus scrape | 7 |
 
 ---
@@ -332,8 +406,9 @@ control, because a network gives nothing away for free.
 that path has no builder to go through. A side effect is that a cycle cannot be constructed
 through the fluent API at all, so the cycle test assembles node records directly.
 
-**Sinks are `Operator<IN, Void>`.** Not a separate interface. The run loop stays uniform, and
-`IcebergSink` in Phase 6 is written exactly as the companion PDF §12.1 shows it.
+**Sinks are `Operator<IN, Void>`.** Not a separate interface. The run loop stays uniform.
+`IcebergSink` adds the optional `CheckpointListener` lifecycle: its interval file is prepared in
+task state and becomes visible only after the durable checkpoint callback.
 
 **`keyBy` creates no node.** Keying is a property of the next edge, not a step that does work.
 Materialising it would mean a thread that only rehashes. The user's name for it is carried on

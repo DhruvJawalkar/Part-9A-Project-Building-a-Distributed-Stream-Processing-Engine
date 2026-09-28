@@ -198,8 +198,10 @@ public final class TaskManager implements AutoCloseable {
                 TimeUnit.MILLISECONDS);
 
         Thread thread = new Thread(task, taskKey);
+        boolean checkpointCompletionParticipant = deployment.getOperators(
+                deployment.getOperatorsCount() - 1).getKind() == OperatorKind.OPERATOR_SINK;
         tasks.put(taskKey, new RunningTask(taskKey, deployment.getJobId(), headOperatorId, subtask,
-                task, thread, output, flushTask, metrics));
+                checkpointCompletionParticipant, task, thread, output, flushTask, metrics));
 
         thread.start();
         return taskKey;
@@ -464,6 +466,22 @@ public final class TaskManager implements AutoCloseable {
             if (task.jobId().equals(jobId) && task.task() instanceof OperatorTask operator) {
                 operator.abortCheckpoint(checkpointId);
             }
+        }
+    }
+
+    /** Delivers a durable-checkpoint callback to the sink chains hosted by this worker. */
+    public void notifyCheckpointComplete(String jobId, long checkpointId) throws Exception {
+        List<java.util.concurrent.CompletableFuture<Void>> notifications = new ArrayList<>();
+        for (RunningTask task : List.copyOf(tasks.values())) {
+            if (task.jobId().equals(jobId) && task.checkpointCompletionParticipant()) {
+                notifications.add(task.notifyCheckpointComplete(checkpointId));
+            }
+        }
+        for (java.util.concurrent.CompletableFuture<Void> notification : notifications) {
+            // A catalog commit may include object-store metadata writes and is allowed the same
+            // bounded window as the master's completion RPC. The RPC must not report success
+            // before these futures do.
+            notification.get(30, TimeUnit.SECONDS);
         }
     }
 

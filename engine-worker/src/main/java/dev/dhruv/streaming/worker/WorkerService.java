@@ -67,11 +67,16 @@ final class WorkerService extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public void notifyCheckpointComplete(CheckpointId id, StreamObserver<Empty> response) {
-        // Phase 6 gives sinks a transactional commit hook. It is intentionally a no-op for the
-        // Phase 4 console sink, but accepting it now keeps checkpoint completion ordered.
-        log.debug("checkpoint {} completed on this worker", id.getCheckpointId());
-        response.onNext(Empty.getDefaultInstance());
-        response.onCompleted();
+        try {
+            // Do not acknowledge the gRPC call until the sink callback has completed. Otherwise
+            // a failed external commit would look successful to the master.
+            taskManager.notifyCheckpointComplete(id.getJobId(), id.getCheckpointId());
+            response.onNext(Empty.getDefaultInstance());
+            response.onCompleted();
+        } catch (Exception failure) {
+            log.error("could not complete checkpoint {}", id.getCheckpointId(), failure);
+            response.onError(failure);
+        }
     }
 
     @Override

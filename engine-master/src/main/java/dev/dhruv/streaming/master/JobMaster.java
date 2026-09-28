@@ -318,16 +318,25 @@ public final class JobMaster implements AutoCloseable {
             ExecutionGraph plan = ExecutionGraphCompiler.compile(graph, workers);
             Map<String, String> handles = new LinkedHashMap<>();
             checkpoint.taskStates().forEach((task, state) -> handles.put(task, state.stateHandleUri()));
-            // All tasks -- including healthy ones -- are redeployed. See the class-level comment:
-            // mixing a restored task with survivors that kept running would replay an inconsistent
-            // part of the stream.
-            deployer.deployFromCheckpoint(graph, plan, workers, handles);
+            // Publish the generation we are about to deploy before making any remote call. If
+            // deployment or completion replay fails (or this master dies between them), the
+            // next recovery attempt can identify and cancel this exact assignment set rather
+            // than accidentally targeting the previous generation.
             executionGraphs.put(jobId, plan);
             finishedTasks.put(jobId, ConcurrentHashMap.newKeySet());
             taskStatuses.put(jobId, new ConcurrentHashMap<>());
             Map<String, String> assignments = new LinkedHashMap<>();
-            plan.assignments().forEach((key, assignment) -> assignments.put(key, assignment.workerId()));
+            plan.assignments().forEach((key, assignment) ->
+                    assignments.put(key, assignment.workerId()));
             metadata.putAssignments(jobId, assignments);
+            // All tasks -- including healthy ones -- are redeployed. See the class-level comment:
+            // mixing a restored task with survivors that kept running would replay an inconsistent
+            // part of the stream.
+            deployer.deployFromCheckpoint(graph, plan, workers, handles);
+            // A commit acknowledgement can be lost when the master dies after a sink has
+            // committed but before the sink clears its pending checkpoint state. Replay the
+            // durable checkpoint after every restore; transactional sinks make this idempotent.
+            deployer.notifySinks(graph, plan, checkpoint.checkpointId());
             metadata.putJobState(jobId, JobState.RUNNING);
             startCheckpointing(graph, plan);
             log.info("job {} restarted from checkpoint {}", jobId, checkpoint.checkpointId());
@@ -355,7 +364,17 @@ public final class JobMaster implements AutoCloseable {
 
             @Override
             public void notifySinks(String jobId, long checkpointId) {
-                deployer.notifySinks(graph, plan, checkpointId);
+                try {
+                    deployer.notifySinks(graph, plan, checkpointId);
+                } catch (RuntimeException failure) {
+                    // The checkpoint pointer is already durable when this callback runs. Do
+                    // not admit a later checkpoint while an external commit is uncertain:
+                    // roll the whole job back to this checkpoint and replay the idempotent
+                    // completion notification as part of recovery.
+                    failJob(jobId, "checkpoint " + checkpointId
+                            + " completion delivery failed: " + failure.getMessage());
+                    throw failure;
+                }
             }
 
             @Override
@@ -469,9 +488,13 @@ public final class JobMaster implements AutoCloseable {
                     freshlyCompiled.chainGroups(), restoredAssignments);
             executionGraphs.put(jobId, restored);
             if (state == JobState.RUNNING) {
-                // The tasks survived the master's absence. Do not deploy a duplicate; merely
-                // resume coordinating barriers against the recovered physical plan.
-                startCheckpointing(graph, restored);
+                // A surviving task may have an in-flight barrier whose id was never persisted.
+                // Starting a fresh coordinator against it could reuse that id and produce an
+                // inconsistent external-sink snapshot. Reconcile a RUNNING job exactly like a
+                // worker failure: cancel every survivor and restore one coherent cut. Recovery
+                // also replays the durable completion notification before barriers resume.
+                failJob(jobId, "master recovered a running job; reconciling every task from "
+                        + "the latest completed checkpoint");
             }
         } catch (RuntimeException failure) {
             log.warn("could not reconstruct in-memory plan for recovered job {}: {}", jobId,

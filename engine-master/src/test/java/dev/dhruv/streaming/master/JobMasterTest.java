@@ -12,6 +12,7 @@ import dev.dhruv.streaming.metadata.JobState;
 import dev.dhruv.streaming.metadata.MetadataStore;
 import dev.dhruv.streaming.metadata.CompletedCheckpoint;
 import dev.dhruv.streaming.runtime.SerializationUtil;
+import dev.dhruv.streaming.rpc.CheckpointAck;
 import dev.dhruv.streaming.rpc.TaskId;
 import dev.dhruv.streaming.rpc.TaskState;
 import dev.dhruv.streaming.rpc.TaskStatus;
@@ -221,8 +222,8 @@ class JobMasterTest {
     }
 
     @Test
-    @DisplayName("a restarted master rebuilds its plan without deploying a second copy")
-    void restartedMasterRebuildsPlanForLaterFailureRecovery() {
+    @DisplayName("a restarted master fails safely when a running job has no recovery point")
+    void restartedMasterDoesNotReuseCheckpointIdsWithoutARecoveryPoint() {
         JobGraph graph = lmsShapedJob();
         master.submit(graph, SerializationUtil.toBytes(graph));
         master.close();
@@ -230,12 +231,42 @@ class JobMasterTest {
         RecordingDeployer recoveredDeployer = new RecordingDeployer();
         JobMaster restarted = new JobMaster(metadata, recoveredDeployer,
                 new CheckpointCoordinator.Config(Duration.ofDays(1), Duration.ofSeconds(1)),
-                RestartStrategy.fixedDelayDefault());
+                new RestartStrategy(1, Duration.ZERO));
         try {
             restarted.recover();
 
             assertThat(restarted.planOf(graph.jobId())).isPresent();
             assertThat(recoveredDeployer.deployed).isEmpty();
+            assertThat(recoveredDeployer.cancelledJobs).contains(graph.jobId());
+            assertThat(restarted.stateOf(graph.jobId())).contains(JobState.FAILED);
+        } finally {
+            restarted.close();
+        }
+    }
+
+    @Test
+    @DisplayName("a restarted master restores every task before replaying durable completion")
+    void restartedMasterRestoresWholeJobAndReplaysCompletion() throws InterruptedException {
+        JobGraph graph = lmsShapedJob();
+        ExecutionGraph plan = master.submit(graph, SerializationUtil.toBytes(graph));
+        CompletedCheckpoint checkpoint = checkpointFor(plan);
+        metadata.putLatestCompletedCheckpoint(graph.jobId(), checkpoint);
+        master.close();
+
+        RecordingDeployer recoveredDeployer = new RecordingDeployer();
+        JobMaster restarted = new JobMaster(metadata, recoveredDeployer,
+                new CheckpointCoordinator.Config(Duration.ofDays(1), Duration.ofSeconds(1)),
+                new RestartStrategy(1, Duration.ZERO));
+        try {
+            restarted.recover();
+
+            assertThat(recoveredDeployer.deployed).isEmpty();
+            assertThat(recoveredDeployer.restarted.await(1, TimeUnit.SECONDS)).isTrue();
+            assertThat(awaitState(restarted, graph.jobId(), JobState.RUNNING)).isTrue();
+            assertThat(recoveredDeployer.cancelledJobs).contains(graph.jobId());
+            assertThat(recoveredDeployer.recoveredDeployments).contains(graph.jobId());
+            assertThat(recoveredDeployer.notifiedCheckpoints)
+                    .containsExactly(graph.jobId() + ":" + checkpoint.checkpointId());
         } finally {
             restarted.close();
         }
@@ -307,6 +338,61 @@ class JobMasterTest {
         assertThat(deployer.cancelledJobs).contains(graph.jobId());
         assertThat(deployer.recoveredDeployments).contains(graph.jobId());
         assertThat(deployer.lastRecoveryHandles).hasSize(initialPlan.taskCount());
+    }
+
+    @Test
+    @DisplayName("recovery replays completion for the restored durable checkpoint")
+    void recoveryReplaysCheckpointCompletionForIdempotentSinks() throws InterruptedException {
+        master.close();
+        deployer = new RecordingDeployer();
+        master = new JobMaster(metadata, deployer,
+                new CheckpointCoordinator.Config(Duration.ofDays(1), Duration.ofSeconds(1)),
+                new RestartStrategy(1, Duration.ZERO));
+        JobGraph graph = lmsShapedJob();
+        ExecutionGraph plan = master.submit(graph, SerializationUtil.toBytes(graph));
+        CompletedCheckpoint checkpoint = checkpointFor(plan);
+        metadata.putLatestCompletedCheckpoint(graph.jobId(), checkpoint);
+
+        master.onTaskFailure(graph.jobId(), "drop-bots:2", "simulated worker loss");
+
+        assertThat(deployer.restarted.await(1, TimeUnit.SECONDS)).isTrue();
+        // deployFromCheckpoint releases the latch before it returns; RUNNING is published only
+        // after the recovery completion replay has been delivered.
+        assertThat(awaitState(graph.jobId(), JobState.RUNNING)).isTrue();
+        assertThat(deployer.notifiedCheckpoints)
+                .containsExactly(graph.jobId() + ":" + checkpoint.checkpointId());
+    }
+
+    @Test
+    @DisplayName("a failed sink completion delivery rolls back and retries before more checkpoints")
+    void completionDeliveryFailureRestartsFromTheDurableCheckpoint() throws InterruptedException {
+        master.close();
+        deployer = new RecordingDeployer();
+        master = new JobMaster(metadata, deployer,
+                new CheckpointCoordinator.Config(Duration.ofDays(1), Duration.ofSeconds(1)),
+                new RestartStrategy(1, Duration.ZERO));
+        JobGraph graph = lmsShapedJob();
+        ExecutionGraph plan = master.submit(graph, SerializationUtil.toBytes(graph));
+        deployer.failNextNotification = true;
+
+        long checkpointId = master.triggerCheckpoint(graph.jobId()).orElseThrow();
+        List<String> taskKeys = new ArrayList<>(plan.assignments().keySet());
+        for (int index = 0; index < taskKeys.size() - 1; index++) {
+            master.acknowledgeCheckpoint(checkpointAck(graph.jobId(), taskKeys.get(index),
+                    checkpointId));
+        }
+
+        assertThatThrownBy(() -> master.acknowledgeCheckpoint(checkpointAck(graph.jobId(),
+                taskKeys.getLast(), checkpointId)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("simulated completion delivery failure");
+
+        assertThat(deployer.restarted.await(1, TimeUnit.SECONDS)).isTrue();
+        assertThat(awaitState(graph.jobId(), JobState.RUNNING)).isTrue();
+        assertThat(metadata.getLatestCompletedCheckpoint(graph.jobId()))
+                .get().extracting(CompletedCheckpoint::checkpointId).isEqualTo(checkpointId);
+        assertThat(deployer.notifiedCheckpoints)
+                .containsExactly(graph.jobId() + ":" + checkpointId);
     }
 
     @Test
@@ -400,6 +486,19 @@ class JobMasterTest {
         return new CompletedCheckpoint(1, 1234, handles);
     }
 
+    private static CheckpointAck checkpointAck(String jobId, String taskKey, long checkpointId) {
+        int separator = taskKey.lastIndexOf(':');
+        return CheckpointAck.newBuilder()
+                .setTaskId(TaskId.newBuilder()
+                        .setJobId(jobId)
+                        .setOperatorId(taskKey.substring(0, separator))
+                        .setSubtaskIndex(Integer.parseInt(taskKey.substring(separator + 1))))
+                .setCheckpointId(checkpointId)
+                .setStateHandleUri("file:///checkpoint/" + taskKey.replace(':', '-'))
+                .setStateSizeBytes(10)
+                .build();
+    }
+
     private boolean awaitState(String jobId, JobState expected) throws InterruptedException {
         return awaitState(master, jobId, expected);
     }
@@ -422,11 +521,13 @@ class JobMasterTest {
         private final List<String> deployed = new ArrayList<>();
         private final List<String> cancelledJobs = new ArrayList<>();
         private final List<String> recoveredDeployments = new ArrayList<>();
+        private final List<String> notifiedCheckpoints = new ArrayList<>();
         private final CountDownLatch restarted = new CountDownLatch(1);
         private Map<String, String> lastRecoveryHandles = Map.of();
         private List<String> lastRecoveryWorkers = List.of();
         private boolean failRecoveredDeployment;
         private boolean failInitialDeployment;
+        private boolean failNextNotification;
 
         @Override
         public void deploy(JobGraph graph, ExecutionGraph plan, List<RegisteredWorker> workers) {
@@ -434,6 +535,12 @@ class JobMasterTest {
                 throw new IllegalStateException("simulated initial deployment failure");
             }
             deployed.add(graph.jobId());
+        }
+
+        @Override
+        public void triggerSources(JobGraph graph, ExecutionGraph plan, long checkpointId,
+                                   long triggerTimestamp) {
+            // Tests acknowledge the deterministic checkpoint directly.
         }
 
         @Override
@@ -453,6 +560,15 @@ class JobMasterTest {
             if (failRecoveredDeployment) {
                 throw new IllegalStateException("simulated redeploy failure");
             }
+        }
+
+        @Override
+        public void notifySinks(JobGraph graph, ExecutionGraph plan, long checkpointId) {
+            if (failNextNotification) {
+                failNextNotification = false;
+                throw new IllegalStateException("simulated completion delivery failure");
+            }
+            notifiedCheckpoints.add(graph.jobId() + ":" + checkpointId);
         }
     }
 }

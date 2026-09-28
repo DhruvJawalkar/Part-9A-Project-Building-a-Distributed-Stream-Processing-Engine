@@ -59,7 +59,8 @@ public interface TaskDeployer {
 
     /** Announces a completed checkpoint to sink tasks only. */
     default void notifySinks(JobGraph graph, ExecutionGraph plan, long checkpointId) {
-        throw new UnsupportedOperationException("checkpoint completion is not configured");
+        // Useful for in-memory deployers in lifecycle tests. The production gRPC deployer
+        // overrides this; a deployer with no external transactional sink has nothing to do.
     }
 
     /** Releases task inputs blocked while aligning an incomplete checkpoint. */

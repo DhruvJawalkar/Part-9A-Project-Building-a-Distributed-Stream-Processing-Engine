@@ -344,19 +344,24 @@ public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
 
     @Override
     public void notifySinks(JobGraph graph, ExecutionGraph plan, long checkpointId) {
+        // TaskManager fans one completion message out to every sink task for this job on the
+        // worker. Contact each worker once: sending once per sink subtask would replay the same
+        // notification many times when a worker hosts several sink tasks.
+        java.util.Set<RegisteredWorker> sinkWorkers = new LinkedHashSet<>();
         for (ChainGroup chain : plan.chainGroups()) {
             if (!(chain.tail() instanceof SinkNode)) {
                 continue;
             }
             for (int subtask = 0; subtask < chain.parallelism(); subtask++) {
-                RegisteredWorker worker = workerFor(plan, chain.id(), subtask);
-                stubFor(worker).withDeadlineAfter(5, TimeUnit.SECONDS)
-                        .notifyCheckpointComplete(CheckpointId.newBuilder()
-                                .setCheckpointId(checkpointId)
-                                .setJobId(graph.jobId())
-                                .build());
+                sinkWorkers.add(workerFor(plan, chain.id(), subtask));
             }
         }
+        CheckpointId completion = CheckpointId.newBuilder()
+                .setCheckpointId(checkpointId)
+                .setJobId(graph.jobId())
+                .build();
+        sinkWorkers.forEach(worker -> stubFor(worker).withDeadlineAfter(30, TimeUnit.SECONDS)
+                .notifyCheckpointComplete(completion));
     }
 
     @Override

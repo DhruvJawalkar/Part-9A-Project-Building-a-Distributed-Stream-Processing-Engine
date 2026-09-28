@@ -47,6 +47,9 @@ stop_cluster
 echo "building..."
 (cd "$ROOT" && ./gradlew -q installDist) || { echo "build failed" >&2; exit 1; }
 
+echo "initialising Iceberg output tables..."
+"$ROOT/demos/iceberg/init-schema.sh" || { echo "Iceberg schema setup failed" >&2; exit 1; }
+
 # The workers were compiled with no knowledge of this job, so they have to be told where its
 # classes are. A production engine ships the job's JAR as part of submission; this project takes
 # the shortcut of naming the classpath at worker startup. See UserCodeClassLoader for why a
@@ -115,4 +118,6 @@ docker exec lms-etcd etcdctl --endpoints=http://localhost:2379 \
 echo
 echo "logs are in demos/logs/"
 echo "submit the job with:  ./gradlew :lms-job:submitToCluster"
+echo "the submitter defaults to REST :8181 and the host-visible MinIO endpoint :9000;"
+echo "set ICEBERG_* variables on that submit command to override them."
 echo "stop the cluster with: ./demos/run-cluster.sh stop"

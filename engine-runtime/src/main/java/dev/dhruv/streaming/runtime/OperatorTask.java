@@ -1,6 +1,7 @@
 package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.CheckpointBarrier;
+import dev.dhruv.streaming.api.CheckpointListener;
 import dev.dhruv.streaming.api.KeySelector;
 import dev.dhruv.streaming.api.KeyedOperator;
 import dev.dhruv.streaming.api.Operator;
@@ -25,7 +26,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -82,7 +88,20 @@ public final class OperatorTask implements Runnable {
     private final boolean[] endOfStreamChannels;
     private volatile boolean running = true;
     private volatile boolean started;
+    private volatile boolean taskThreadTerminated;
+    private final Object checkpointLifecycleLock = new Object();
     private Optional<StateHandle> restoreHandle = Optional.empty();
+    private Serializable restoredOperatorCheckpointState;
+    private boolean restoreOperatorCheckpointState;
+    private final ConcurrentLinkedQueue<CheckpointNotification> pendingCheckpointNotifications =
+            new ConcurrentLinkedQueue<>();
+    /** Prepared external work keeps a bounded sink alive until completion or abort arrives. */
+    private final Set<Long> preparedExternalCheckpoints = new HashSet<>();
+    /**
+     * Monotonic fence for coordinator-aborted barriers. Checkpoint ids increase within an
+     * execution attempt, so one high-water mark is enough and cannot grow without bound.
+     */
+    private final AtomicLong highestAbortedCheckpointId = new AtomicLong();
 
     private volatile long lastCheckpointId;
     private volatile long lastCheckpointDurationMillis;
@@ -177,14 +196,19 @@ public final class OperatorTask implements Runnable {
                 restoreCheckpoint(restoreHandle.get());
             }
             operator.open(context);
+            if (restoreOperatorCheckpointState && operator instanceof CheckpointListener listener) {
+                listener.restoreCheckpointState(restoredOperatorCheckpointState);
+            }
 
             while (running) {
+                processPendingCheckpointNotifications();
                 Optional<InputGate.IncomingElement> incoming =
                         inputGate.poll(POLL_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
                 if (incoming.isEmpty()) {
                     // Nothing arrived. Ship anything batched rather than let it wait for
                     // traffic that may not come.
                     output.flush();
+                    stopAfterEndOfInputWhenCheckpointCallbacksAreDone();
                     continue;
                 }
 
@@ -208,6 +232,15 @@ public final class OperatorTask implements Runnable {
             log.error("task {} failed", taskId, e);
             failureListener.accept(taskId, e);
         } finally {
+            synchronized (checkpointLifecycleLock) {
+                try {
+                    processPendingCheckpointNotifications();
+                } catch (Exception failure) {
+                    log.error("task {} failed while draining checkpoint callbacks", taskId, failure);
+                    failureListener.accept(taskId, failure);
+                }
+                taskThreadTerminated = true;
+            }
             closeQuietly();
             log.info("task {} stopped after {} records", taskId, recordsIn.count());
         }
@@ -266,7 +299,7 @@ public final class OperatorTask implements Runnable {
                     }
                 });
                 output.flush();
-                running = false;
+                stopAfterEndOfInputWhenCheckpointCallbacksAreDone();
             }
             return;
         }
@@ -304,6 +337,11 @@ public final class OperatorTask implements Runnable {
     }
 
     private void handleBarrier(CheckpointBarrier barrier, int channelIndex) throws Exception {
+        if (barrier.checkpointId() <= highestAbortedCheckpointId.get()) {
+            // The abort RPC can overtake a barrier delayed in the network. Such a barrier must
+            // disappear completely: no alignment, pre-commit, snapshot, forwarding, or ack.
+            return;
+        }
         Optional<BarrierAligner.AlignedCheckpoint> aligned =
                 barrierAligner.onBarrier(barrier, channelIndex);
         if (aligned.isEmpty()) {
@@ -313,7 +351,13 @@ public final class OperatorTask implements Runnable {
         BarrierAligner.AlignedCheckpoint checkpoint = aligned.get();
         long snapshotStarted = System.nanoTime();
         try {
-            StateHandle handle = snapshotCheckpoint(checkpoint.barrier().checkpointId());
+            long checkpointId = checkpoint.barrier().checkpointId();
+            Serializable operatorCheckpointState = operator instanceof CheckpointListener listener
+                    && checkpointLifecycleEnabled() ? listener.preCommit(checkpointId) : null;
+            StateHandle handle = snapshotCheckpoint(checkpointId, operatorCheckpointState);
+            if (checkpointLifecycleEnabled()) {
+                preparedExternalCheckpoints.add(checkpointId);
+            }
 
             // This order is the checkpoint protocol, not an implementation detail. Downstream
             // must see the barrier before the coordinator can observe this acknowledgement;
@@ -350,7 +394,23 @@ public final class OperatorTask implements Runnable {
 
     /** Releases inputs held by a checkpoint that the coordinator has abandoned. */
     public void abortCheckpoint(long checkpointId) {
+        highestAbortedCheckpointId.accumulateAndGet(checkpointId, Math::max);
+        // BarrierAligner is synchronized specifically so the control plane can release
+        // backpressured channels even while the task thread is publishing its acknowledgement.
+        // User operator callbacks remain queued and single-threaded below.
         barrierAligner.abortAlignment(checkpointId);
+        enqueueCheckpointNotification(CheckpointNotification.aborted(checkpointId));
+    }
+
+    /**
+     * Queues a durable-checkpoint notification for this task's thread.
+     *
+     * <p>gRPC handler threads must not call user operators directly: the same sink instance is
+     * processing records on this task thread. The run loop drains this queue between stream
+     * elements, preserving the single-threaded operator guarantee.
+     */
+    public CompletableFuture<Void> notifyCheckpointComplete(long checkpointId) {
+        return enqueueCheckpointNotification(CheckpointNotification.completed(checkpointId));
     }
 
     /** Latest checkpoint figures, carried in the worker heartbeat. */
@@ -359,14 +419,16 @@ public final class OperatorTask implements Runnable {
                 lastCheckpointStateBytes, lastAlignmentMillis);
     }
 
-    private StateHandle snapshotCheckpoint(long checkpointId) throws IOException {
+    private StateHandle snapshotCheckpoint(long checkpointId, Serializable operatorCheckpointState)
+            throws IOException {
         Path directory = checkpointDirectory.resolve("checkpoint-" + checkpointId);
         Files.createDirectories(directory);
         StateHandle keyedState = stateBackend.snapshot(checkpointId,
                 directory.resolve("keyed-state"));
         Path envelope = directory.resolve("operator-task.bin");
         OperatorSnapshot snapshot = new OperatorSnapshot(relativePath(directory, keyedState),
-                keyedState.sizeBytes(), timerService.snapshot(), watermarkTracker.snapshot());
+                keyedState.sizeBytes(), timerService.snapshot(), watermarkTracker.snapshot(),
+                operatorCheckpointState, checkpointId);
         try (ObjectOutputStream outputStream =
                      new ObjectOutputStream(Files.newOutputStream(envelope))) {
             outputStream.writeObject(snapshot);
@@ -386,6 +448,11 @@ public final class OperatorTask implements Runnable {
                     snapshot.stateSizeBytes()));
             timerService.restore(snapshot.timerSnapshot());
             watermarkTracker.restore(snapshot.watermarkSnapshot());
+            restoredOperatorCheckpointState = snapshot.operatorCheckpointState();
+            restoreOperatorCheckpointState = true;
+            if (checkpointLifecycleEnabled() && snapshot.checkpointId() > 0) {
+                preparedExternalCheckpoints.add(snapshot.checkpointId());
+            }
         } catch (ClassNotFoundException failure) {
             throw new IOException("could not deserialize operator checkpoint", failure);
         }
@@ -489,6 +556,62 @@ public final class OperatorTask implements Runnable {
         return (StreamRecord<Object>) record;
     }
 
+    private CompletableFuture<Void> enqueueCheckpointNotification(CheckpointNotification notification) {
+        synchronized (checkpointLifecycleLock) {
+            if (taskThreadTerminated) {
+                // The mailbox was drained before close; later duplicate completion notices are
+                // already reflected in the task's durable state and must not reopen a sink.
+                notification.completion().complete(null);
+                return notification.completion();
+            }
+            pendingCheckpointNotifications.add(notification);
+            return notification.completion();
+        }
+    }
+
+    private void processPendingCheckpointNotifications() throws Exception {
+        CheckpointNotification notification;
+        while ((notification = pendingCheckpointNotifications.poll()) != null) {
+            try {
+                deliverCheckpointNotification(notification);
+                notification.completion().complete(null);
+                preparedExternalCheckpoints.remove(notification.checkpointId());
+            } catch (Exception failure) {
+                notification.completion().completeExceptionally(failure);
+                throw failure;
+            }
+        }
+        stopAfterEndOfInputWhenCheckpointCallbacksAreDone();
+    }
+
+    private void deliverCheckpointNotification(CheckpointNotification notification) throws Exception {
+        if (!notification.completed()) {
+            // BarrierAligner and user operators both belong to this task thread. The atomic
+            // high-water mark above fences newly arriving barriers immediately; this releases
+            // any channel that was already blocked by the abandoned alignment.
+            barrierAligner.abortAlignment(notification.checkpointId());
+        }
+        if (operator instanceof CheckpointListener listener) {
+            if (notification.completed()) {
+                listener.notifyCheckpointComplete(notification.checkpointId());
+            } else {
+                listener.notifyCheckpointAborted(notification.checkpointId());
+            }
+        }
+    }
+
+    private boolean checkpointLifecycleEnabled() {
+        return operator instanceof CheckpointListener
+                && (!(operator instanceof OperatorChain chain) || chain.hasCheckpointListeners());
+    }
+
+    private void stopAfterEndOfInputWhenCheckpointCallbacksAreDone() {
+        if (endOfStreamMarkersSeen == inputGate.channelCount()
+                && preparedExternalCheckpoints.isEmpty()) {
+            running = false;
+        }
+    }
+
     private static final class WatermarkHandlingException extends RuntimeException {
         private WatermarkHandlingException(Exception cause) {
             super(cause);
@@ -509,7 +632,20 @@ public final class OperatorTask implements Runnable {
     private record OperatorSnapshot(String stateHandlePath,
                                     long stateSizeBytes,
                                     TimerService.TimerSnapshot timerSnapshot,
-                                    WatermarkTracker.Snapshot watermarkSnapshot)
+                                    WatermarkTracker.Snapshot watermarkSnapshot,
+                                    Serializable operatorCheckpointState,
+                                    long checkpointId)
             implements Serializable {
+    }
+
+    private record CheckpointNotification(long checkpointId, boolean completed,
+                                          CompletableFuture<Void> completion) {
+        private static CheckpointNotification completed(long checkpointId) {
+            return new CheckpointNotification(checkpointId, true, new CompletableFuture<>());
+        }
+
+        private static CheckpointNotification aborted(long checkpointId) {
+            return new CheckpointNotification(checkpointId, false, new CompletableFuture<>());
+        }
     }
 }

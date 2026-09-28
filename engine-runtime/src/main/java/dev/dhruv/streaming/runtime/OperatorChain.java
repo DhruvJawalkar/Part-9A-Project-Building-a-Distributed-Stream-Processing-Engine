@@ -1,11 +1,13 @@
 package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.Collector;
+import dev.dhruv.streaming.api.CheckpointListener;
 import dev.dhruv.streaming.api.Operator;
 import dev.dhruv.streaming.api.OperatorContext;
 import dev.dhruv.streaming.api.StreamRecord;
 
 import java.util.ArrayList;
+import java.io.Serializable;
 import java.util.List;
 
 /**
@@ -30,7 +32,7 @@ import java.util.List;
  * engines either copy defensively or document the constraint loudly; this one documents it,
  * because copying every record would undo most of what chaining bought.
  */
-public final class OperatorChain implements Operator<Object, Object> {
+public final class OperatorChain implements Operator<Object, Object>, CheckpointListener {
 
     private static final long serialVersionUID = 1L;
 
@@ -102,6 +104,66 @@ public final class OperatorChain implements Operator<Object, Object> {
         }
         if (failure != null) {
             throw failure;
+        }
+    }
+
+    /**
+     * Snapshots every checkpoint-aware member in chain order. Keeping placeholders for ordinary
+     * operators makes the envelope unambiguous when only the tail is transactional.
+     */
+    @Override
+    public Serializable preCommit(long checkpointId) throws Exception {
+        List<Serializable> states = new ArrayList<>(operators.size());
+        for (Operator<Object, Object> operator : operators) {
+            states.add(operator instanceof CheckpointListener listener
+                    ? listener.preCommit(checkpointId) : null);
+        }
+        return new ChainCheckpointState(states);
+    }
+
+    /** Whether any member needs the transactional checkpoint lifecycle. */
+    boolean hasCheckpointListeners() {
+        return operators.stream().anyMatch(CheckpointListener.class::isInstance);
+    }
+
+    @Override
+    public void restoreCheckpointState(Serializable checkpointState) throws Exception {
+        if (checkpointState == null) {
+            return;
+        }
+        if (!(checkpointState instanceof ChainCheckpointState state)
+                || state.states().size() != operators.size()) {
+            throw new IllegalArgumentException("checkpoint state does not match operator chain");
+        }
+        for (int index = 0; index < operators.size(); index++) {
+            Operator<Object, Object> operator = operators.get(index);
+            if (operator instanceof CheckpointListener listener) {
+                listener.restoreCheckpointState(state.states().get(index));
+            }
+        }
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) throws Exception {
+        for (Operator<Object, Object> operator : operators) {
+            if (operator instanceof CheckpointListener listener) {
+                listener.notifyCheckpointComplete(checkpointId);
+            }
+        }
+    }
+
+    @Override
+    public void notifyCheckpointAborted(long checkpointId) throws Exception {
+        for (Operator<Object, Object> operator : operators) {
+            if (operator instanceof CheckpointListener listener) {
+                listener.notifyCheckpointAborted(checkpointId);
+            }
+        }
+    }
+
+    private record ChainCheckpointState(List<Serializable> states) implements Serializable {
+        private ChainCheckpointState {
+            states = new ArrayList<>(states);
         }
     }
 

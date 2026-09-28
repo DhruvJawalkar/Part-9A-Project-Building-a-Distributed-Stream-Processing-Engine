@@ -1,0 +1,13 @@
+{
+  "type": "struct",
+  "schema-id": 0,
+  "fields": [
+    {"id": 1, "name": "member_id", "required": true, "type": "string"},
+    {"id": 2, "name": "catalog_item_id", "required": true, "type": "string"},
+    {"id": 3, "name": "search_term", "required": true, "type": "string"},
+    {"id": 4, "name": "loan_id", "required": true, "type": "string"},
+    {"id": 5, "name": "click_time", "required": true, "type": "timestamp"},
+    {"id": 6, "name": "borrow_time", "required": true, "type": "timestamp"},
+    {"id": 7, "name": "conversion_delay_ms", "required": true, "type": "long"}
+  ]
+}

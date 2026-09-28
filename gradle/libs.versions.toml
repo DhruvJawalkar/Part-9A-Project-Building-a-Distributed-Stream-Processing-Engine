@@ -19,6 +19,9 @@ testcontainers = "1.21.4"
 awaitility = "4.3.0"
 rocksdb = "9.10.0"
 minio = "8.5.17"
+iceberg = "1.11.0"
+hadoop = "3.3.6"
+parquet = "1.17.1"
 
 [libraries]
 junit-bom      = { module = "org.junit:junit-bom",                version.ref = "junit" }
@@ -54,6 +57,15 @@ rocksdb-jni        = { module = "org.rocksdb:rocksdbjni",       version.ref = "r
 # Phase 4: durable, worker-independent checkpoint archives. MinIO exposes the S3 API used by
 # the local compose environment as well as production-compatible object stores.
 minio              = { module = "io.minio:minio",                version.ref = "minio" }
+
+# Phase 6: immutable Parquet files become visible through one atomic Iceberg metadata commit.
+iceberg-core        = { module = "org.apache.iceberg:iceberg-core", version.ref = "iceberg" }
+iceberg-parquet     = { module = "org.apache.iceberg:iceberg-parquet", version.ref = "iceberg" }
+iceberg-aws         = { module = "org.apache.iceberg:iceberg-aws", version.ref = "iceberg" }
+iceberg-aws-bundle  = { module = "org.apache.iceberg:iceberg-aws-bundle", version.ref = "iceberg" }
+hadoop-common       = { module = "org.apache.hadoop:hadoop-common", version.ref = "hadoop" }
+hadoop-mapreduce-client-core = { module = "org.apache.hadoop:hadoop-mapreduce-client-core", version.ref = "hadoop" }
+parquet-avro        = { module = "org.apache.parquet:parquet-avro", version.ref = "parquet" }
 
 [plugins]
 protobuf = { id = "com.google.protobuf", version.ref = "protobufPlugin" }

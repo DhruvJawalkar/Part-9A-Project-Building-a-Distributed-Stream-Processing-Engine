@@ -1,0 +1,22 @@
+{
+  "name": "browse_sessions",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "member_id", "required": true, "type": "string"},
+      {"id": 2, "name": "session_start", "required": true, "type": "timestamp"},
+      {"id": 3, "name": "last_event", "required": true, "type": "timestamp"},
+      {"id": 4, "name": "session_end", "required": true, "type": "timestamp"},
+      {"id": 5, "name": "duration_ms", "required": true, "type": "long"},
+      {"id": 6, "name": "click_count", "required": true, "type": "long"},
+      {"id": 7, "name": "search_terms", "required": true, "type": {"type": "list", "element-id": 8, "element": "string", "element-required": true}}
+    ]
+  },
+  "partition-spec": {
+    "spec-id": 0,
+    "fields": []
+  },
+  "write-order": {"order-id": 0, "fields": []},
+  "properties": {"format-version": "2", "write.format.default": "parquet"}
+}

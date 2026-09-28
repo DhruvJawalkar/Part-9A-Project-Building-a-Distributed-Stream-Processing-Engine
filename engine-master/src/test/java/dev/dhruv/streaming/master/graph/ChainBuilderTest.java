@@ -1,6 +1,7 @@
 package dev.dhruv.streaming.master.graph;
 
 import dev.dhruv.streaming.api.Collector;
+import dev.dhruv.streaming.api.CheckpointListener;
 import dev.dhruv.streaming.api.KeyedOperator;
 import dev.dhruv.streaming.api.Operator;
 import dev.dhruv.streaming.api.Source;
@@ -40,6 +41,19 @@ class ChainBuilderTest {
         assertThat(chains.getFirst().operatorIds())
                 .containsExactly("in", "drop-bots", "uppercase", "out");
         assertThat(chains.getFirst().isChained()).isTrue();
+    }
+
+    @Test
+    @DisplayName("a transactional sink is its own checkpoint task")
+    void transactionalSinkBreaksTheChain() {
+        JobGraph.Builder job = JobGraph.named("transactional-sink");
+        job.source("in", noopSource()).parallelism(1)
+                .sink("out", new TransactionalSink()).parallelism(1);
+
+        List<ChainGroup> chains = ChainBuilder.build(job.build());
+
+        assertThat(chains).extracting(ChainGroup::operatorIds)
+                .containsExactly(List.of("in"), List.of("out"));
     }
 
     @Test
@@ -147,6 +161,13 @@ class ChainBuilderTest {
     private static Operator<String, Void> printSink() {
         return (record, out) -> {
         };
+    }
+
+    private static final class TransactionalSink
+            implements Operator<String, Void>, CheckpointListener {
+        @Override
+        public void processElement(StreamRecord<String> record, Collector<Void> out) {
+        }
     }
 
     private static KeyedOperator<String, String, String> keyedPassThrough() {

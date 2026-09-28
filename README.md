@@ -2,8 +2,8 @@
 
 A teaching implementation of a distributed stream processing engine in Java 21. It runs master
 and worker processes, routes records over gRPC, processes keyed streams in event time, and recovers
-the whole job from coordinated checkpoints. It also includes a keyed event-time interval join;
-transactional Iceberg output remains a later phase.
+the whole job from coordinated checkpoints. It also includes a keyed event-time interval join and
+checkpoint-transactional Iceberg output.
 
 It accompanies **Part 9A: Stream Processing Fundamentals** of the *Developing Intuition on
 Building Blocks — Systems Design* series. The article explains how an engine like this works;
@@ -37,7 +37,7 @@ implementation stops is part of understanding what production engines do for you
 | **3** | Event time, watermarks, keyed state, session windows | **Complete** |
 | **4** | Checkpointing, barrier alignment, portable state, recovery | **Complete** |
 | **5** | Two-stream event-time interval join and conversion branch | **Complete** |
-| 6 | Transactional Iceberg sink | Planned |
+| 6 | Transactional Iceberg sink, REST catalog and MinIO demo surface | **Complete** |
 | 7 | Status API and the four demos | Planned |
 
 ---
@@ -47,19 +47,22 @@ implementation stops is part of understanding what production engines do for you
 Requires **JDK 21+** and **Docker**.
 
 ```bash
-docker compose up -d          # Kafka, etcd and MinIO; topics are created with 4 partitions
-./demos/run-cluster.sh        # master on :7000 and three workers on :7001-7003
-./demos/seed-clicks.sh        # publish clicks
-./demos/seed-borrows.sh       # publish borrows; either fixture can be seeded first
+docker compose up -d          # Kafka, etcd, MinIO and the Iceberg REST catalog
+./demos/iceberg/init-schema.sh # create lms.analytics and both output tables
+./demos/run-cluster.sh         # also runs the idempotent schema init; master :7000, workers :7001-7003
+./demos/seed-clicks.sh         # publish clicks
+./demos/seed-borrows.sh        # publish borrows; either fixture can be seeded first
 ./gradlew :lms-job:submitToCluster
 ```
 
-The job has two outputs: `SessionRow` values when a session closes and `ConversionRow` values for
-a `RESULT_CLICK` followed by a matching borrow within 30 event-time minutes. Both input fixtures
-are deterministic, and click/borrow arrival order does not change the join result. Kafka partition
-positions are owned by the engine: the next offset is captured in each source checkpoint, and
-recovery seeks to that offset without relying on broker-committed consumer-group positions. Run
-the full unit suite with `./gradlew test`. The focused Phase 3 proof is:
+The job writes two unpartitioned Iceberg tables: `lms.analytics.browse_sessions` for closed
+`SessionRow` values and `lms.analytics.click_conversions` for a `RESULT_CLICK` followed by a
+matching borrow within 30 event-time minutes. Both input fixtures are deterministic, and
+click/borrow arrival order does not change the join result. `run-cluster.sh` initializes the
+schema as well, so the explicit init step can be omitted when using that launcher alone. Kafka
+partition positions are owned by the engine: the next offset is captured in each source
+checkpoint, and recovery seeks to that offset without relying on broker-committed consumer-group
+positions. Run the full unit suite with `./gradlew test`. The focused Phase 3 proof is:
 
 ```bash
 ./gradlew :engine-runtime:test :lms-job:test :engine-connectors:test
@@ -72,16 +75,17 @@ run through Gradle; the Docker-backed MinIO check is
 `./gradlew :engine-worker:integrationTest`. The Phase 5 join tests run with `./gradlew :engine-api:test`
 and the LMS fixture replay with `./gradlew :lms-job:test`.
 
-Keep the cluster running while you inspect the session and conversion output in `demos/logs/`.
+Keep the cluster running while you inspect the session and conversion rows in the two Iceberg
+tables. `demos/logs/` contains master/worker operational logs rather than result rows.
 When finished, stop the workers with `./demos/run-cluster.sh stop`, then stop dependencies with
 `docker compose down -v`.
 
 ### A note on output ordering
 
-Printed session rows are not globally ordered, and that is not a bug. The `by-member` hash edge
-keeps each member on one session subtask, but different member keys run independently and the
-two sink subtasks print independently. Ordering survives within one keyed partition; a global
-ordering would require an explicit downstream coordination point and is not part of this engine.
+Session rows are not globally ordered, and that is not a bug. The `by-member` hash edge keeps each
+member on one session subtask, but different member keys run independently before the singleton
+Iceberg writer. Ordering survives within one keyed partition; a global result ordering would
+require an explicit downstream coordination point and is not part of this engine.
 
 ### If `./gradlew` fails with a bare version number
 
@@ -279,8 +283,10 @@ The cluster launcher accepts `CHECKPOINT_INTERVAL_MS`, `CHECKPOINT_TIMEOUT_MS`,
   fully completed checkpoint. Nested paths are relative to the archive, so recovery can download
   and restore on a different worker filesystem. A filesystem-backed archive store is available
   for local tests.
-- **Whole-job recovery** — on worker loss, the master cancels every task, loads the latest completed
-  checkpoint from etcd, and redeploys the full DAG with each task's state handle. A worker declared
+- **Whole-job recovery** — on worker loss or master restart, the master cancels every task, loads
+  the latest completed checkpoint from etcd, and redeploys the full DAG with each task's state handle.
+  Rewinding after a master restart also fences any checkpoint id that was in flight only in the old
+  master's memory. A worker declared
   dead is quarantined from scheduling until it registers afresh. The job moves through
   `FAILING → RESTARTING → RUNNING`, or becomes `FAILED` when no checkpoint exists or attempts are
   exhausted.
@@ -320,13 +326,13 @@ The LMS job now has two event-time branches. Clean clicks still feed session agg
 clicks also join with borrows keyed by `ConversionKey(memberId, catalogItemId)`:
 
 ```text
-clicks → drop-bots ──┬── keyBy(memberId) → SessionAggregator → session console
+clicks → drop-bots ──┬── keyBy(memberId) → SessionAggregator → browse_sessions
                      └── RESULT_CLICK → Either.left ───────────┐
 borrows ───────────────────────────────→ Either.right ─────────┤
                                                                └─ union(REBALANCE)
                                                                   → keyBy(ConversionKey)
                                                                   → IntervalJoinOperator
-                                                                  → conversion console
+                                                                  → click_conversions
 ```
 
 `engine-api` exposes the sealed `Either<L,R>` tag, `JoinFunction`, and keyed
@@ -357,6 +363,63 @@ boundary observable.
 
 ---
 
+## What Phase 6 built
+
+Phase 6 makes the external output boundary transactional for unpartitioned Iceberg tables. The
+engine's optional `CheckpointListener` lifecycle is deliberately small:
+
+- After a task aligns a barrier, `preCommit(checkpointId)` runs on the task thread before the
+  keyed-state snapshot. Its serializable return value is stored in the task checkpoint envelope
+  beside keyed state, timers, watermarks and source position. On recovery, the operator is opened
+  first and then receives that saved state.
+- Once every physical task has acknowledged, the master writes the completed-checkpoint pointer
+  and all task handles to etcd. Only after that durable write does it notify sink tasks. Completion
+  and abort callbacks are queued and executed by each operator task's own run loop, so a gRPC
+  handler never calls user code concurrently with record processing.
+- Recovery redeploys the whole graph from the durable pointer. It replays the completion callback
+  for that checkpoint because a master can fail after a sink commit but before the callback has
+  been observed. The sink's current-table check makes that replay idempotent.
+
+`IcebergSink` owns one Parquet writer per checkpoint interval. `preCommit` closes the writer and
+stores its path, size and row count as pending file state, then opens the next interval's writer.
+Those files are not table rows yet: only `notifyCheckpointComplete` appends the missing paths in
+one Iceberg metadata commit. Before appending, the sink refreshes the current table and scans
+reachable data-file paths, so a repeated completion cannot append a file twice. An aborted
+checkpoint or a worker lost after closing a writer leaves an object-store orphan; it is absent from
+every Iceberg snapshot and therefore contributes no visible rows. The next worker replays source
+records from the last completed checkpoint and publishes one replacement file, preserving each
+logical row exactly once.
+
+The LMS graph creates one singleton sink subtask for each table, making each checkpoint interval a
+single table append. The exact table names are `lms.analytics.browse_sessions` and
+`lms.analytics.click_conversions`. Workers construct the REST catalog and S3 file IO from
+serializable settings rather than shipping a catalog client in the job. Compose starts Kafka,
+etcd, MinIO and `apache/iceberg-rest-fixture`; MinIO provides the `warehouse` bucket and
+checkpoint bucket, while `demos/iceberg/init-schema.sh` idempotently bootstraps the namespace and
+both table schemas. The host-launched workers use `localhost:8181` for the catalog and
+`localhost:9000` for MinIO; the catalog container uses `minio:9000` internally.
+
+### Phase 6 acceptance evidence
+
+`IcebergSinkAcceptanceTest` exercises the transaction protocol with Iceberg's in-memory catalog
+and local file IO. It verifies that Parquet files and rows remain invisible to a table scan until
+checkpoint completion, that completion replay creates no duplicate snapshot or row, and that a
+simulated lost sink leaves the old closed file as an unreachable orphan while a restored sink
+exposes each replayed row once. Its deterministic six-event cadence comparison is:
+
+| Checkpoint cadence | First visibility | Data files | Snapshots | Rows |
+|---|---:|---:|---:|---:|
+| Short | 100 ms | 3 | 3 | 6 |
+| Long | 500 ms | 1 | 1 | 6 |
+
+The shorter cadence makes rows visible sooner at the cost of more small files. This Phase 6 sink
+supports unpartitioned tables only; opening a partitioned destination fails explicitly rather than
+silently producing incorrect file metadata. The Compose REST-catalog/MinIO surface is executable
+demo infrastructure. The opt-in `IcebergRestMinioSmokeTest` verifies the real REST catalog,
+`S3FileIO`, MinIO write and checkpoint commit path; it is not claimed as a process-kill test.
+
+---
+
 ## Known limitations
 
 Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
@@ -367,15 +430,19 @@ Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
 | No dynamic rescaling | Parallelism is fixed at submission. Key groups are implemented, so the hard part is done | Add a savepoint command, restore at a different parallelism, let `KeyGroupAssigner` redistribute |
 | No savepoints | Phase 4 checkpoints are recovery points managed by the running job, without user-triggered retention or restore selection | `POST /jobs/{id}/savepoint` and a `--fromSavepoint` flag |
 | No unaligned checkpoints | Phase 4 uses aligned barriers and buffers post-barrier records on blocked channels | Persist in-flight channel buffers for unaligned checkpoints |
+| Iceberg sink supports unpartitioned tables only | Phase 6 keeps the file-to-append protocol legible and validates the destination spec | Add partition transforms and partition-aware `DataFile` construction |
+| No terminal checkpoint for bounded transactional jobs | Periodic checkpoints cover the Kafka-based LMS job, but a bounded source can end after its last barrier | Add an end-of-input protocol in which all sources request and wait for a coordinator-owned final checkpoint before emitting terminal watermarks |
 | No SQL or higher-level API | Framework DSLs are Parts 9B and 9C | A minimal SQL parser producing a `JobGraph` |
 | No security, multi-tenancy or resource isolation | Orthogonal to every mechanism being taught | — |
 
-Additionally, Phase 4 recovery is at-least-once at the whole-job boundary: the console sink has no
-transactional commit protocol, and exactly-once external output is not claimed until Phase 6's
-Iceberg sink. `FileReplaySource` is bounded and deterministic, but the Phase 7 runnable demos have
-not been added. Job classes reach master and workers through a `JOB_CLASSPATH` set at startup
-rather than being shipped with submission, so every process needs the same classpath and changing
-the job means restarting them.
+Additionally, Phase 4 recovery remains at-least-once for non-transactional operators such as the
+console sink. Phase 6 provides exactly-once visible rows for completed checkpoint intervals in its
+unpartitioned Iceberg sink, while orphaned objects still require normal object-store maintenance.
+The production LMS inputs are unbounded Kafka sources; bounded sources currently need an explicit
+checkpoint before exhaustion or their final post-checkpoint interval remains an orphan.
+`FileReplaySource` is bounded and deterministic, but the Phase 7 runnable demos have not been added. Job classes reach master and
+workers through a `JOB_CLASSPATH` set at startup rather than being shipped with submission, so
+every process needs the same classpath and changing the job means restarting them.
 
 ---
 
