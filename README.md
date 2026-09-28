@@ -1,8 +1,8 @@
 # Distributed Stream Processing Engine
 
-A teaching implementation of a distributed stream processing engine in Java 21: master and
-worker processes, event-time watermarks, consistent checkpoints via barrier alignment, and
-exactly-once output to Apache Iceberg.
+A teaching implementation of a distributed stream processing engine in Java 21. It currently
+runs master and worker processes, routes records over gRPC, and processes keyed streams in event
+time; checkpointing and exactly-once Iceberg output are the next planned phases.
 
 It accompanies **Part 9A: Stream Processing Fundamentals** of the *Developing Intuition on
 Building Blocks — Systems Design* series. The article explains how an engine like this works;
@@ -12,6 +12,7 @@ on its own before the next is added.
 The design rationale, interfaces and algorithm sketches live in
 [`docs/Part9A_Project_Companion.pdf`](docs/Part9A_Project_Companion.pdf).
 [`CLAUDE.md`](CLAUDE.md) is the authoritative build instruction.
+[`docs/DESIGN.md`](docs/DESIGN.md) is the living implementation design.
 [`docs/BUG-LOG.md`](docs/BUG-LOG.md) records every bug found while building this, and why most of
 them produced no error at all.
 
@@ -32,11 +33,11 @@ implementation stops is part of understanding what production engines do for you
 |---|---|---|
 | **1** | Single-process engine: Kafka → filter → console | **Complete** |
 | **2** | Master and worker processes, gRPC transport, etcd | **Complete** |
-| 3 | Event time, watermarks, session windows | Not started |
-| 4 | Checkpointing, barrier alignment, recovery | Not started |
-| 5 | The interval join | Not started |
-| 6 | Transactional Iceberg sink | Not started |
-| 7 | Status API and the four demos | Not started |
+| **3** | Event time, watermarks, keyed state, session windows | **Complete** |
+| 4 | Checkpointing, barrier alignment, recovery | Planned |
+| 5 | The interval join | Planned |
+| 6 | Transactional Iceberg sink | Planned |
+| 7 | Status API and the four demos | Planned |
 
 ---
 
@@ -50,28 +51,36 @@ docker compose up -d          # Kafka (KRaft), topics created with 4 partitions
 ./gradlew :lms-job:run        # run the job; Ctrl-C to stop
 ```
 
-You should see 15 lines. The fixture holds 20 events and `BotFilter` drops five: three from
-`bot-*` member ids, one with a blank member id, and one with no event time.
+The job now prints `SessionRow` values, rather than one line per click. A row appears when the
+event-time watermark reaches the session end (15 minutes after the latest event for that member).
+That delay is deliberate: it is the proof that the job is using when an event happened, not when
+the process happened to receive it.
 
 To watch offsets being committed and resumed:
 
 ```bash
 ./gradlew :lms-job:run        # run once, let it consume, Ctrl-C
-./gradlew :lms-job:run        # run again: nothing, it resumed from the committed offset
+./gradlew :lms-job:run        # run again: Kafka resumes from its committed offset
 ./demos/seed-clicks.sh        # publish more
-./gradlew :lms-job:run        # 15 more lines
+./gradlew :lms-job:run        # observe rows for the new event-time sessions
 ```
 
-Run the tests with `./gradlew test`. Tear everything down with `docker compose down -v`.
+Run the full test suite with `./gradlew test`. The focused Phase 3 proof is:
+
+```bash
+./gradlew :engine-runtime:test :lms-job:test :engine-connectors:test
+```
+
+It covers bounded out-of-orderness, the silent-partition/idleness regression, keyed routing and
+state, timer key restoration, session extension, stale-timer suppression, state clearing, and
+deterministic file replay. Tear everything down with `docker compose down -v`.
 
 ### A note on output ordering
 
-Printed lines are not in event-time order, and per member they are not in publish order either.
-That is not a bug and it is worth understanding. The sink runs at parallelism 2 behind a filter
-at parallelism 4, so the edge between them is a **rebalance**: records round-robin across the
-two sink subtasks, and two threads print independently. Ordering survives inside a partition
-and across a forward edge; a redistributing exchange gives it up. Phase 3's session aggregator
-is where that begins to matter, and where a `keyBy` replaces the rebalance.
+Printed session rows are not globally ordered, and that is not a bug. The `by-member` hash edge
+keeps each member on one session subtask, but different member keys run independently and the
+two sink subtasks print independently. Ordering survives within one keyed partition; a global
+ordering would require an explicit downstream coordination point and is not part of this engine.
 
 ### If `./gradlew` fails with a bare version number
 
@@ -93,7 +102,8 @@ engine-api/          No runtime dependencies, ever. StreamElement, Operator, Key
 engine-rpc/          No engine dependencies. The .proto wire contracts and generated stubs.
 engine-metadata/     No engine dependencies. MetadataStore, etcd and in-memory implementations.
 engine-runtime/      → engine-api, engine-rpc
-                     Task run loop, operator chaining, input gates, transport, serialization.
+                     Task run loop, event time, keyed state and timers, input gates, transport,
+                     serialization.
 engine-master/       → engine-api, engine-rpc, engine-metadata, engine-runtime
                      JobMaster, ExecutionGraph compiler, TaskTracker, JobClient.
 engine-worker/       → engine-api, engine-rpc, engine-metadata, engine-runtime
@@ -205,6 +215,44 @@ master had never been told the job existed. Submission now goes through `MasterS
 
 ---
 
+## What Phase 3 built
+
+Phase 3 makes the runtime care about event time. The LMS job is now:
+
+```text
+Kafka clicks → drop-bots → keyBy(memberId) → SessionAggregator → console
+```
+
+`keyBy` is an edge property, not an operator. `ResultPartitionWriter` hashes the key through
+`KeyGroupAssigner`, so all records for one member reach the same `SessionAggregator` subtask.
+That task sets the current key before calling user code; the operator's `ValueState` handles and
+event-time timer registrations are therefore automatically scoped to that member.
+
+- **Source watermark generation** — `BoundedOutOfOrdernessGenerator` emits the greatest event
+  time seen minus the configured disorder allowance. `withIdleness(Duration)` makes a silent
+  source subtask emit an in-band idle status; `Duration.ZERO` disables that detection.
+- **Watermark propagation** — `WatermarkTracker` retains one watermark per input channel and
+  advances only to the minimum across active channels. It never moves a task clock backwards.
+  An idle channel is excluded, and becomes active again before its resumed record is sent.
+- **Timers and state** — `TimerService` fires due timers in timestamp order and restores the
+  timer's key into `InMemoryStateBackend` before the callback. State handles acquired in
+  `open()` resolve the current key on every access.
+- **Sessions** — `SessionAggregator` retains a running accumulator and end timestamp per member,
+  not a list of input events. Extending a session registers a later timer; when an old timer
+  fires it is ignored by comparing against the stored end. An event beyond the current end
+  closes/resets the prior session, and an unmergeably late event is counted/dropped; the matching
+  timer emits and clears both entries.
+- **Reproducible input** — `FileReplaySource` reads a JSON Lines fixture as a bounded,
+  deterministically partitioned source for tests and future demos.
+
+Two intentionally visible boundaries matter. A bounded source emits `Watermark.MAX` only after
+it has reached EOF, and an operator task forwards MAX only after every input channel has ended;
+an idle channel must never turn one channel's end into a false whole-job end. Also, keyed
+operators form a chain boundary today: each keyed task owns one key context, state backend and
+timer service. This keeps scope obvious until state names are namespaced per operator.
+
+---
+
 ## Known limitations
 
 Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
@@ -213,18 +261,18 @@ Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
 |---|---|---|
 | Master is a single point of failure | Leader election is Part 6 material; Flink has the same property without HA configured | etcd already holds the metadata — add a lease-based election and a standby master |
 | No dynamic rescaling | Parallelism is fixed at submission. Key groups are implemented, so the hard part is done | Add a savepoint command, restore at a different parallelism, let `KeyGroupAssigner` redistribute |
-| No savepoints | Checkpoints exist; savepoints are checkpoints with a retention policy and stable operator ids, which the graph already assigns | `POST /jobs/{id}/savepoint` and a `--fromSavepoint` flag |
-| Aligned checkpoints only | Alignment is the mechanism being taught; unaligned checkpointing would obscure it | Persist in-flight buffered records in the snapshot and skip channel blocking |
+| No savepoints | Checkpointing itself is planned for Phase 4; savepoints come after it with a retention policy and stable operator ids | `POST /jobs/{id}/savepoint` and a `--fromSavepoint` flag |
+| No checkpointing yet | Phase 4 introduces aligned checkpoints because the mechanism is the lesson | Later persist in-flight buffered records for unaligned checkpoints |
 | No SQL or higher-level API | Framework DSLs are Parts 9B and 9C | A minimal SQL parser producing a `JobGraph` |
 | No security, multi-tenancy or resource isolation | Orthogonal to every mechanism being taught | — |
 
-Additionally, as of Phase 2: there is no state and no checkpointing, so a worker death fails the
-job outright -- there is no consistent point to rewind to yet, and creating one is what Phase 4 is
-for. Offsets are still committed by Kafka on its own schedule, which is at-least-once and nothing
-stronger. Keyed (`HASH`) exchanges are rejected with a message naming Phase 3, which adds them
-along with keyed state. Job classes reach the master and workers through a `JOB_CLASSPATH` set at
-startup rather than being shipped with the submission, so every process needs the same classpath
-and changing the job means restarting them.
+Additionally, as of Phase 3: state is heap-backed and is not yet included in a coordinated job
+checkpoint. A worker death still fails the job outright; there is no consistent whole-job point
+to rewind to until planned Phase 4. Kafka offsets remain broker-managed, so the end-to-end
+delivery guarantee is at-least-once rather than exactly-once. `FileReplaySource` is bounded and
+deterministic, but the Phase 7 runnable demos have not been added. Job classes reach master and
+workers through a `JOB_CLASSPATH` set at startup rather than being shipped with submission, so
+every process needs the same classpath and changing the job means restarting them.
 
 ---
 

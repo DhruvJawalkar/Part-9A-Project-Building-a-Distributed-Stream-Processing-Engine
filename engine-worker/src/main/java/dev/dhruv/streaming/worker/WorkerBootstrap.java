@@ -141,7 +141,21 @@ public final class WorkerBootstrap implements AutoCloseable {
     }
 
     private void reportTaskFailure(String taskKey, Throwable failure) {
-        String[] parts = taskKey.split("#");
+        // Operator ids are user supplied and may legitimately contain '#'. The separator is
+        // therefore the final one, immediately before the numeric subtask index.
+        int separator = taskKey.lastIndexOf('#');
+        if (separator < 1 || separator == taskKey.length() - 1) {
+            log.error("could not parse task identity '{}' while reporting failure", taskKey);
+            return;
+        }
+        String operatorId = taskKey.substring(0, separator);
+        int subtaskIndex;
+        try {
+            subtaskIndex = Integer.parseInt(taskKey.substring(separator + 1));
+        } catch (NumberFormatException e) {
+            log.error("could not parse task identity '{}' while reporting failure", taskKey, e);
+            return;
+        }
         StringWriter stack = new StringWriter();
         failure.printStackTrace(new PrintWriter(stack));
 
@@ -149,8 +163,8 @@ public final class WorkerBootstrap implements AutoCloseable {
             masterBlocking.reportTaskFailure(TaskFailure.newBuilder()
                     .setWorkerId(workerId)
                     .setTaskId(TaskId.newBuilder()
-                            .setOperatorId(parts[0])
-                            .setSubtaskIndex(Integer.parseInt(parts[1])))
+                            .setOperatorId(operatorId)
+                            .setSubtaskIndex(subtaskIndex))
                     .setMessage(failure.getClass().getSimpleName() + ": " + failure.getMessage())
                     .setStackTrace(stack.toString())
                     .build());

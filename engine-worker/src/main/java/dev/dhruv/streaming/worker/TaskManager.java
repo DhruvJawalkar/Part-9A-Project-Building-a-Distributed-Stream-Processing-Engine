@@ -2,6 +2,7 @@ package dev.dhruv.streaming.worker;
 
 import dev.dhruv.streaming.api.ExchangeStrategy;
 import dev.dhruv.streaming.api.Operator;
+import dev.dhruv.streaming.api.KeySelector;
 import dev.dhruv.streaming.api.Source;
 import dev.dhruv.streaming.api.TimestampAssigner;
 import dev.dhruv.streaming.rpc.ChainedOperator;
@@ -191,11 +192,14 @@ public final class TaskManager implements AutoCloseable {
         String senderTaskId = TaskInputRegistry.taskKey(tailOperatorId, subtaskIndex);
 
         ExchangeStrategy exchange = toApi(outputs.getFirst().getExchange());
+        Optional<KeySelector<?, ?>> keySelector = SerializationUtil.fromBytesOrEmpty(
+                outputs.getFirst().getSerializedKeySelector().toByteArray());
         List<ResultSubpartition> subpartitions = new ArrayList<>(outputs.size());
         for (OutputChannel channel : outputs) {
             subpartitions.add(openChannel(senderTaskId, channel, exchange, subtaskIndex));
         }
-        return new ResultPartitionWriter(subpartitions, exchange, subtaskIndex);
+        return new ResultPartitionWriter(subpartitions, exchange, subtaskIndex,
+                keySelector.orElse(null));
     }
 
     private ResultSubpartition openChannel(String senderTaskId,
@@ -251,6 +255,8 @@ public final class TaskManager implements AutoCloseable {
                         ? new ChainedSourceOutput(chained.get(), output, metrics)
                         : output,
                 assigner,
+                head.getOutOfOrdernessMillis(),
+                head.getIdleTimeoutMillis(),
                 metrics);
         task.onFailure(failureListener);
         return task;
@@ -284,7 +290,10 @@ public final class TaskManager implements AutoCloseable {
                 ? operators.getFirst()
                 : new OperatorChain(operators);
 
-        OperatorTask task = new OperatorTask(taskKey, operator, gate, output, metrics);
+        Optional<KeySelector<?, ?>> keySelector = SerializationUtil.fromBytesOrEmpty(
+                deployment.getOperators(0).getSerializedKeySelector().toByteArray());
+
+        OperatorTask task = new OperatorTask(taskKey, operator, gate, output, keySelector, metrics);
         task.onFailure(failureListener);
         return task;
     }

@@ -5,6 +5,7 @@ import dev.dhruv.streaming.api.Operator;
 import dev.dhruv.streaming.api.OperatorContext;
 import dev.dhruv.streaming.api.StreamElement;
 import dev.dhruv.streaming.api.StreamRecord;
+import dev.dhruv.streaming.api.Watermark;
 import dev.dhruv.streaming.runtime.RuntimeOperatorContext;
 import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
 import dev.dhruv.streaming.runtime.transport.Output;
@@ -64,10 +65,23 @@ final class ChainedSourceOutput implements Output {
 
     @Override
     public void broadcast(StreamElement element) throws InterruptedException {
-        // Control elements pass through the chain rather than being processed by it. A watermark
-        // does reach the chained operators -- Phase 3 wires that up -- but it is forwarded
-        // regardless, because downstream tasks are waiting for it.
-        downstream.broadcast(element);
+        openOnce();
+        try {
+            if (element instanceof Watermark watermark && !watermark.isIdle()
+                    && watermark.timestamp() != Long.MIN_VALUE) {
+                // The source's event-time clock must cross a fused operator as a callback before
+                // the marker itself is sent on. This preserves the same data/control ordering an
+                // unchained OperatorTask provides, and keeps outputs from onWatermark stamped
+                // with the triggering event time.
+                currentTimestamp = watermark.timestamp();
+                chained.onWatermark(watermark.timestamp(), collector);
+            }
+            downstream.broadcast(element);
+        } catch (InterruptedException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("a chained operator failed on a watermark", e);
+        }
     }
 
     @Override

@@ -5,6 +5,7 @@ import dev.dhruv.streaming.api.graph.JobGraph;
 import dev.dhruv.streaming.api.graph.LogicalOperator;
 import dev.dhruv.streaming.api.graph.SinkNode;
 import dev.dhruv.streaming.api.graph.SourceNode;
+import dev.dhruv.streaming.api.graph.TransformNode;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -23,13 +24,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class LmsClickstreamJobTest {
 
     @Test
-    @DisplayName("describes source, filter and sink")
+    @DisplayName("describes source, filter, session aggregation and sink")
     void graphShape() {
         JobGraph graph = LmsClickstreamJob.buildGraph();
 
         assertThat(graph.name()).isEqualTo("lms-clickstream");
         assertThat(graph.operators()).extracting(LogicalOperator::id)
-                .containsExactly("clicks", "drop-bots", "console");
+                .containsExactly("clicks", "drop-bots", "sessions", "console");
         assertThat(graph.sources()).extracting(LogicalOperator::id).containsExactly("clicks");
         assertThat(graph.sinks()).extracting(LogicalOperator::id).containsExactly("console");
     }
@@ -71,13 +72,13 @@ class LmsClickstreamJobTest {
     }
 
     @Test
-    @DisplayName("uses no keyed exchange yet")
-    void nothingIsKeyedYet() {
-        // Phase 3 adds the session aggregator and with it the first hash exchange. Until then
-        // the job is embarrassingly parallel, which is why Phase 1 can run it without a key
-        // group in sight.
-        assertThat(LmsClickstreamJob.buildGraph().operators())
-                .noneMatch(op -> op instanceof SinkNode sink
-                        && sink.inputExchange() == ExchangeStrategy.HASH);
+    @DisplayName("hashes member events into the session aggregator")
+    void sessionsAreKeyedByMember() {
+        LogicalOperator sessions = LmsClickstreamJob.buildGraph().operator("sessions").orElseThrow();
+
+        assertThat(sessions).isInstanceOf(TransformNode.class);
+        TransformNode sessionNode = (TransformNode) sessions;
+        assertThat(sessionNode.inputExchange()).isEqualTo(ExchangeStrategy.HASH);
+        assertThat(sessionNode.partitionName()).contains("by-member");
     }
 }

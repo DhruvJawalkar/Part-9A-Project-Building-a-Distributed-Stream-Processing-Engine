@@ -137,6 +137,7 @@ public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
                         .setHost(targetWorker.host())
                         .setDataPort(targetWorker.dataPort())
                         .setLocal(targetWorker.workerId().equals(worker.workerId()))
+                        .setSerializedKeySelector(bytesOrEmpty(keySelectorOf(downstream.head())))
                         .build());
             }
         }
@@ -231,6 +232,15 @@ public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
     private static boolean isForward(LogicalOperator operator) {
         return ChainBuilder.inputExchangeOf(operator)
                 == dev.dhruv.streaming.api.ExchangeStrategy.FORWARD;
+    }
+
+    private static Optional<dev.dhruv.streaming.api.KeySelector<?, ?>> keySelectorOf(
+            LogicalOperator operator) {
+        return switch (operator) {
+            case TransformNode transform -> transform.keySelector();
+            case SinkNode sink -> sink.keySelector();
+            case SourceNode ignored -> Optional.empty();
+        };
     }
 
     private static ByteString bytes(Serializable value) {

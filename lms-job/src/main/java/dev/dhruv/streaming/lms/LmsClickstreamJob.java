@@ -12,8 +12,8 @@ import java.time.Duration;
 /**
  * The LMS catalog clickstream job.
  *
- * <p>Phase 1 runs the front of it: read clicks from Kafka, drop bot traffic, print what
- * survives. Session aggregation arrives in Phase 3, the conversion join in Phase 5, and the
+ * <p>The Phase 3 shape reads clicks from Kafka, drops bot traffic, groups the remaining events
+ * by member, and prints completed sessions. The conversion join arrives in Phase 5 and the
  * Iceberg sink in Phase 6, at which point this same method describes the whole pipeline.
  *
  * <p>What this class deliberately cannot do is reach into the engine. It compiles against the
@@ -81,7 +81,10 @@ public final class LmsClickstreamJob {
 
         clicks.filter("drop-bots", new BotFilter())
                 .parallelism(4)
-                .sink("console", new ConsoleSink<ClickEvent>("click | "))
+                .keyBy("by-member", ClickEvent::memberId)
+                .process("sessions", new SessionAggregator())
+                .parallelism(4)
+                .sink("console", new ConsoleSink<SessionRow>("session | "))
                 .parallelism(2);
 
         return job.build();

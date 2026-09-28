@@ -75,6 +75,9 @@ message OutputChannel {
   string host = 4;
   int32 data_port = 5;
   bool local = 6;    // same worker: hand over in memory rather than over the wire
+  // The selector belongs to the destination input edge. A HASH sender needs the exact same
+  // serialized function the receiving keyed task uses to restore its state context.
+  bytes serialized_key_selector = 7;
 }
 
 enum ExchangeStrategy {

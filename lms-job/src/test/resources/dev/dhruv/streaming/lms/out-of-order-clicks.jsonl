@@ -1,0 +1,4 @@
+{"memberId":"member-alpha","catalogItemId":"catalog-1","searchTerm":"later","eventType":"RESULT_CLICK","eventTimeMillis":20000}
+{"memberId":"member-alpha","catalogItemId":"catalog-2","searchTerm":"earlier","eventType":"SEARCH","eventTimeMillis":18000}
+{"memberId":"member-beta","catalogItemId":"catalog-3","searchTerm":"concurrency","eventType":"RESULT_CLICK","eventTimeMillis":1000000}
+{"memberId":"member-alpha","catalogItemId":"catalog-4","searchTerm":"new session","eventType":"SEARCH","eventTimeMillis":2000000}

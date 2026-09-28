@@ -1,0 +1,5 @@
+{"memberId":"m-session-1","catalogItemId":"cat-100","searchTerm":"watermarks","eventType":"SEARCH","eventTimeMillis":1757836810000}
+{"memberId":"m-session-2","catalogItemId":"cat-200","searchTerm":"keyed state","eventType":"SEARCH","eventTimeMillis":1757836808000}
+{"memberId":"m-session-1","catalogItemId":"cat-101","searchTerm":"event time","eventType":"RESULT_CLICK","eventTimeMillis":1757836807000}
+{"memberId":"m-session-1","catalogItemId":"cat-102","searchTerm":"watermarks","eventType":"RESULT_CLICK","eventTimeMillis":1757836820000}
+{"memberId":"m-session-2","catalogItemId":"cat-201","searchTerm":"timers","eventType":"RESULT_CLICK","eventTimeMillis":1757836810000}

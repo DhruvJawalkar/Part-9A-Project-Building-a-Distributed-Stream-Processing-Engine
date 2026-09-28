@@ -56,9 +56,10 @@ class ChainBuilderTest {
 
         List<ChainGroup> chains = ChainBuilder.build(job.build());
 
-        assertThat(chains).hasSize(2);
+        assertThat(chains).hasSize(3);
         assertThat(chains.get(0).operatorIds()).containsExactly("in", "drop-bots");
-        assertThat(chains.get(1).operatorIds()).containsExactly("sessions", "out");
+        assertThat(chains.get(1).operatorIds()).containsExactly("sessions");
+        assertThat(chains.get(2).operatorIds()).containsExactly("out");
     }
 
     @Test

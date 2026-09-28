@@ -2,6 +2,7 @@ package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.ExchangeStrategy;
 import dev.dhruv.streaming.api.JobExecutor;
+import dev.dhruv.streaming.api.KeySelector;
 import dev.dhruv.streaming.api.graph.JobGraph;
 import dev.dhruv.streaming.api.graph.LogicalOperator;
 import dev.dhruv.streaming.api.graph.SinkNode;
@@ -20,6 +21,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -109,6 +111,8 @@ public final class LocalJobExecutor implements JobExecutor {
                     new RuntimeSourceContext(subtask, source.parallelism(), metrics),
                     outputFor(source, subtask),
                     source.timestampAssigner(),
+                    source.outOfOrderness().toMillis(),
+                    source.idleTimeout().toMillis(),
                     metrics);
 
             sourceTasks.add(task);
@@ -117,13 +121,6 @@ public final class LocalJobExecutor implements JobExecutor {
     }
 
     private void startOperatorSubtasks(LogicalOperator node, ExchangeStrategy inputExchange) {
-        if (inputExchange == ExchangeStrategy.HASH) {
-            throw new UnsupportedOperationException(
-                    "operator '" + node.id() + "' needs a hash exchange, which arrives in"
-                            + " Phase 3 along with keyed state. Phase 2 runs forward and"
-                            + " rebalance edges only.");
-        }
-
         List<InputGate> gates = inputGates.get(node.id());
         for (int subtask = 0; subtask < node.parallelism(); subtask++) {
             String taskId = taskId(node, subtask);
@@ -133,6 +130,7 @@ public final class LocalJobExecutor implements JobExecutor {
                     TaskInstances.copyOf(operatorOf(node)),
                     gates.get(subtask),
                     outputFor(node, subtask),
+                    keySelectorOf(node),
                     metrics);
 
             operatorTasks.add(task);
@@ -188,7 +186,8 @@ public final class LocalJobExecutor implements JobExecutor {
         for (int target = 0; target < downstream.parallelism(); target++) {
             subpartitions.add(Subpartitions.local(channelIndex, downstreamGates.get(target)));
         }
-        return new ResultPartitionWriter(subpartitions, exchange, subtaskIndex);
+        return new ResultPartitionWriter(subpartitions, exchange, subtaskIndex,
+                keySelectorOf(downstream).orElse(null));
     }
 
     private static ExchangeStrategy inputExchangeOf(LogicalOperator node) {
@@ -205,6 +204,14 @@ public final class LocalJobExecutor implements JobExecutor {
             case SinkNode sink -> sink.operator();
             case SourceNode ignored -> throw new IllegalStateException(
                     "a source is not run as an operator task: " + node.id());
+        };
+    }
+
+    private static Optional<KeySelector<?, ?>> keySelectorOf(LogicalOperator node) {
+        return switch (node) {
+            case TransformNode transform -> transform.keySelector();
+            case SinkNode sink -> sink.keySelector();
+            case SourceNode ignored -> Optional.empty();
         };
     }
 

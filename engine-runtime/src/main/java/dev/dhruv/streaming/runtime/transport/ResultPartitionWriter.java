@@ -1,6 +1,8 @@
 package dev.dhruv.streaming.runtime.transport;
 
 import dev.dhruv.streaming.api.ExchangeStrategy;
+import dev.dhruv.streaming.api.KeyGroupAssigner;
+import dev.dhruv.streaming.api.KeySelector;
 import dev.dhruv.streaming.api.StreamElement;
 import dev.dhruv.streaming.api.StreamRecord;
 
@@ -23,6 +25,7 @@ public final class ResultPartitionWriter implements Output {
     private final List<ResultSubpartition> subpartitions;
     private final ExchangeStrategy strategy;
     private final int senderSubtaskIndex;
+    private final KeySelector<Object, Object> keySelector;
 
     private int nextRoundRobin;
 
@@ -36,9 +39,22 @@ public final class ResultPartitionWriter implements Output {
     public ResultPartitionWriter(List<ResultSubpartition> subpartitions,
                                  ExchangeStrategy strategy,
                                  int senderSubtaskIndex) {
+        this(subpartitions, strategy, senderSubtaskIndex, null);
+    }
+
+    /**
+     * Creates a writer for a keyed edge. The selector belongs to the downstream input edge,
+     * because that is where the graph says the hash exchange is configured.
+     */
+    @SuppressWarnings("unchecked")
+    public ResultPartitionWriter(List<ResultSubpartition> subpartitions,
+                                 ExchangeStrategy strategy,
+                                 int senderSubtaskIndex,
+                                 KeySelector<?, ?> keySelector) {
         this.subpartitions = List.copyOf(subpartitions);
         this.strategy = strategy;
         this.senderSubtaskIndex = senderSubtaskIndex;
+        this.keySelector = (KeySelector<Object, Object>) keySelector;
     }
 
     @Override
@@ -58,10 +74,7 @@ public final class ResultPartitionWriter implements Output {
 
             case BROADCAST -> broadcast(record);
 
-            // Phase 3 fills this in, routing through KeyGroupAssigner.subtaskFor. It needs the
-            // edge's key selector, which a keyed exchange is required to carry.
-            case HASH -> throw new UnsupportedOperationException(
-                    "hash exchange arrives in Phase 3, together with keyed state");
+            case HASH -> subpartitions.get(subtaskFor(record)).add(record);
         }
     }
 
@@ -91,5 +104,20 @@ public final class ResultPartitionWriter implements Output {
     @Override
     public void close() {
         subpartitions.forEach(ResultSubpartition::close);
+    }
+
+    private int subtaskFor(StreamRecord<?> record) {
+        if (keySelector == null) {
+            throw new IllegalStateException("a hash exchange needs its downstream key selector");
+        }
+        try {
+            Object key = keySelector.getKey(record.value());
+            if (key == null) {
+                throw new IllegalArgumentException("a key selector returned null");
+            }
+            return KeyGroupAssigner.subtaskFor(key, subpartitions.size());
+        } catch (Exception e) {
+            throw new IllegalStateException("could not extract a key for hash routing", e);
+        }
     }
 }

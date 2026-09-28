@@ -38,17 +38,22 @@ The target shape, from §4.1 of the companion PDF:
                                                        +----------------+
 ```
 
-**As of Phase 2 the control plane is real.** A master process serves `MasterService` on :7000;
+**As of Phase 3 the control and data planes are real.** A master process serves `MasterService` on :7000;
 three worker processes serve `WorkerService` and `DataTransportService` on separate ports and
 register in etcd under a TTL lease. Records cross process boundaries over gRPC with credit-based
-flow control. What is still missing from the diagram is everything downstream of a checkpoint:
-MinIO, the Iceberg warehouse, and the coordinator that would write to them.
+flow control. Source tasks now generate event-time watermarks and in-band idle/active status;
+operator tasks advance their local clock from the minimum across active input channels. What is
+still missing from the diagram is everything downstream of a checkpoint: MinIO, the Iceberg
+warehouse, and the coordinator that would write to them.
 
 `LocalJobExecutor` remains, and is still the right tool for tests and demos -- a determinism test
 comparing two runs of one fixture does not get more convincing by involving three processes.
 
-The LMS job as Phase 2 actually schedules it. `clicks` and `drop-bots` fuse into one chain, so
-the job is two chain groups and six vertical slices:
+The LMS job as Phase 3 actually schedules it. `clicks` and `drop-bots` fuse into one ordinary
+chain; the keyed `sessions` operator and narrower `console` sink are separate chain groups. The
+job therefore has ten task instances: four source/filter slices, four session slices, and two
+sink slices. Their exact worker assignment follows the registered-worker order, but every group
+is distributed round-robin:
 
 ```
                           +------------------ etcd ------------------+
@@ -63,16 +68,59 @@ the job is two chain groups and six vertical slices:
 
    worker-1            worker-2                worker-3
    +-------------+     +-------------------+   +-------------------+
-   | clicks:0    |     | clicks:1          |   | clicks:2          |
-   | clicks:3    |     | console:0         |   | console:1         |
+   | chain slices|     | chain slices      |   | chain slices      |
+   | source/filter|    | sessions          |   | console           |
    +-------------+     +-------------------+   +-------------------+
           |                    ^                        ^
           +--- gRPC records, credit-based ---------------+
 
    Kafka (4 partitions) feeds every clicks subtask.
    clicks -> drop-bots is FORWARD and chained: one thread, a method call, no serialization.
-   drop-bots -> console is REBALANCE: round-robin, across the network.
+   drop-bots -> sessions is HASH by member id: key groups route one member to one subtask.
+   sessions -> console is REBALANCE: round-robin, across the network.
 ```
+
+---
+
+## Phase 3 event-time and keyed-state flow
+
+The event-time path is deliberately a data-plane extension, not a separate scheduler. Records,
+watermark claims, idleness transitions, and eventually checkpoint barriers all use the same
+ordered channel. That gives every task one answer to “what happened before this marker?”
+
+```text
+source record (event timestamp)
+        |
+        v
+BoundedOutOfOrdernessGenerator
+  max event time - allowed disorder
+  silent source -> Watermark.IDLE
+        |
+        v                         keyBy(memberId)
+SourceTask -- StreamRecord --> ResultPartitionWriter -- HASH/key group --> OperatorTask
+        |                               |                                  |
+        +-- Watermark / idle status ----+-------------------------------> WatermarkTracker
+                                                                         min(active channels)
+                                                                                |
+                                                                                v
+                                                  InMemoryStateBackend <- current key -> TimerService
+                                                                                |
+                                                                                v
+                                                                    SessionAggregator callback
+```
+
+`Watermark.IDLE` is an explicit in-band transition because an absent message on a distributed
+channel is ambiguous: it could mean an idle source, congestion, or a failed sender. A resumed
+source sends `Watermark.ACTIVE` before its next record. `WatermarkTracker` excludes idle channels
+from its minimum and only forwards a watermark if it advances; the timer service then fires all
+due timers in timestamp order, restoring the key before each callback. A bounded source emits
+`Watermark.MAX` only on EOF. An operator forwards MAX only after all of its input channels have
+ended, preventing an idle channel from converting one upstream EOF into a false whole-job EOF.
+
+The HASH exchange and the keyed runtime must agree on the key selector. The deployer serializes
+the selector on the downstream edge; `ResultPartitionWriter` applies it for routing and
+`OperatorTask` applies it before user code accesses state. This duplicate carriage is deliberate:
+it makes a bad selector deployment fail instead of silently splitting a key’s records and state.
 
 ---
 
@@ -80,20 +128,21 @@ the job is two chain groups and six vertical slices:
 
 | Component | Lives in | Responsibility | Phase |
 |---|---|---|---|
-| `StreamElement` / `StreamRecord` / `Watermark` / `CheckpointBarrier` | engine-api | The record envelope. Control elements travel in band with data, in order, on the same channel | 1 |
+| `StreamElement` / `StreamRecord` / `Watermark` / `CheckpointBarrier` | engine-api | The record envelope. A watermark carries active/idle status as well as a timestamp; control elements travel in band with data | 1–3 |
 | `Operator` / `KeyedOperator` | engine-api | User logic. Single-threaded by contract; `Serializable` because it is shipped to a worker | 1 |
 | `JobGraph` + `DataStream` / `KeyedStream` | engine-api | The logical graph and the builder that produces it. Validated on construction, not in the builder | 1 |
 | `KeyGroupAssigner` | engine-api | `key → key group → subtask`. The indirection that lets parallelism change without rehashing state | 1 |
 | `StateBackend` / `ValueState` / `ListState` | engine-api | Keyed state, narrow enough that heap and RocksDB are interchangeable | 1 (interfaces) |
-| `OperatorTask` | engine-runtime | The run loop. Switches over all three element kinds; watermark and barrier branches stubbed | 1 |
-| `SourceTask` | engine-runtime | Polls a source. Pull-based, which is what makes backpressure reach the broker | 1 |
-| `ResultPartitionWriter` | engine-runtime | Routes records by exchange strategy; broadcasts control elements down the channels it actually feeds | 1 |
+| `OperatorTask` | engine-runtime | The run loop. Restores keyed context, advances watermarks/timers, waits for every EOF; barrier alignment remains planned | 1–3 |
+| `SourceTask` | engine-runtime | Polls a source, assigns event time, emits watermarks and idle/active transitions; pull-based backpressure reaches the broker | 1–3 |
+| `ResultPartitionWriter` | engine-runtime | Routes FORWARD/REBALANCE/BROADCAST/HASH records and broadcasts control elements only down channels it actually feeds | 1–3 |
 | `InputGate` | engine-runtime | One bounded queue per input channel. Reports which channel an element came from, and can block one without blocking the task | 2 |
 | `OperatorChain` | engine-runtime | Fuses adjacent operators into one thread, exchanging records by method call | 2 |
 | `UserCodeClassLoader` | engine-runtime | Loads the job classes the engine was never compiled against | 2 |
 | `TaskInstances` | engine-runtime | Gives each subtask a private copy of its operator, by serialization | 1 |
 | `LocalJobExecutor` | engine-runtime | Single-JVM execution: a thread and a bounded queue per subtask | 1 |
-| `KafkaSource` | engine-connectors | Reads JSON from Kafka. Phase 1 lets Kafka own offsets; Phase 4 takes them back | 1 |
+| `KafkaSource` | engine-connectors | Reads JSON from Kafka. Kafka owns offsets until planned Phase 4 takes them into checkpoints | 1 |
+| `FileReplaySource` | engine-connectors | Bounded, deterministic JSON Lines replay partitioned by stable line hash | 3 |
 | `ConsoleSink` | engine-connectors | Prints. An `Operator<T, Void>` — sinks are not a separate concept | 1 |
 | `JobMaster` | engine-master | Owns the job state machine; persists every transition before acting on it | 2 |
 | `ExecutionGraph` compiler | engine-master | Expands operators to subtasks, builds chain groups, assigns round-robin | 2 |
@@ -106,10 +155,10 @@ the job is two chain groups and six vertical slices:
 | `TaskManager` | engine-worker | Turns a `TaskDeployment` into running threads | 2 |
 | `HeartbeatClient` | engine-worker | Beats to the master and receives commands on the same stream | 2 |
 | `TaskTracker` | engine-master | Heartbeats; a worker is dead after three missed beats | 2 |
-| `WatermarkTracker` | engine-runtime | Per-channel watermarks, minimum across non-idle channels | 3 |
-| `BoundedOutOfOrdernessGenerator` | engine-runtime | Watermark generation with idleness detection | 3 |
-| `TimerService` | engine-runtime | Event-time timers per key, fired in timestamp order | 3 |
-| `InMemoryStateBackend` | engine-runtime | Heap-backed keyed state | 3 |
+| `WatermarkTracker` | engine-runtime | Per-channel watermarks and active/idle status; emits only a forward-moving minimum | 3 |
+| `BoundedOutOfOrdernessGenerator` | engine-runtime | Source watermark generation from max event time minus disorder, with idleness detection | 3 |
+| `TimerService` | engine-runtime | Deduplicated key/timestamp timers, fired in timestamp order with key context restored | 3 |
+| `InMemoryStateBackend` | engine-runtime | Heap-backed keyed value/list state; snapshots exist locally but coordinated checkpoint recovery is planned | 3 |
 | `CheckpointCoordinator` | engine-master | Triggers checkpoints, collects acks, notifies sinks | 4 |
 | `BarrierAligner` | engine-runtime | Chandy-Lamport alignment across input channels | 4 |
 | `RocksDbStateBackend` | engine-runtime | Embedded state, snapshotted to MinIO | 4 |
@@ -168,6 +217,19 @@ expressible.
 **A forward edge between unequal parallelism becomes a rebalance.** Four filters into two sinks
 has no subtask-to-subtask correspondence. Rejecting it would make the natural way of writing a
 narrower sink an error; downgrading is safe because a forward edge is never keyed.
+
+**A keyed operator is a chain boundary.** A keyed task owns one current-key context, one state
+backend and one timer service. Chaining an ordinary neighbour into that task would let it observe
+the keyed operator's state namespace. The engine keeps the boundary explicit until a future
+runtime has per-operator state namespaces inside a chain.
+
+**Idleness is explicit, not inferred.** No message is not a reliable signal on a distributed
+channel. `Watermark.IDLE` and `Watermark.ACTIVE` make the liveness decision visible, ordered with
+the data it affects, and testable.
+
+**EOF requires every channel.** `Watermark.MAX` means a channel is complete, not that a task is
+complete. The task advances to MAX only after every input has ended, even if some inputs were
+previously idle.
 
 ---
 

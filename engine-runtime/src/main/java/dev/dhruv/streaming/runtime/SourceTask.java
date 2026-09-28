@@ -36,6 +36,7 @@ public final class SourceTask implements Runnable {
     private final RuntimeSourceContext context;
     private final Output output;
     private final Optional<TimestampAssigner<Object>> timestampAssigner;
+    private final Optional<BoundedOutOfOrdernessGenerator> watermarkGenerator;
     private final TaskMetricGroup metrics;
     private final Counter recordsOut;
 
@@ -62,11 +63,33 @@ public final class SourceTask implements Runnable {
                       Output output,
                       Optional<? extends TimestampAssigner<?>> timestampAssigner,
                       TaskMetricGroup metrics) {
+        this(taskId, source, context, output, timestampAssigner, 0, 0, metrics);
+    }
+
+    /**
+     * Creates an event-time aware source task.
+     *
+     * <p>Idleness is emitted in band as a watermark status rather than inferred from an absent
+     * watermark downstream. Absence is ambiguous on a distributed channel: it can mean a slow
+     * sender, a congested network, or a genuinely idle source.
+     */
+    @SuppressWarnings("unchecked")
+    public SourceTask(String taskId,
+                      Source<?> source,
+                      RuntimeSourceContext context,
+                      Output output,
+                      Optional<? extends TimestampAssigner<?>> timestampAssigner,
+                      long outOfOrdernessMillis,
+                      long idleTimeoutMillis,
+                      TaskMetricGroup metrics) {
         this.taskId = taskId;
         this.source = (Source<Object>) source;
         this.context = context;
         this.output = output;
         this.timestampAssigner = (Optional<TimestampAssigner<Object>>) timestampAssigner;
+        this.watermarkGenerator = this.timestampAssigner.map(ignored ->
+                new BoundedOutOfOrdernessGenerator(outOfOrdernessMillis,
+                        idleTimeoutMillis == 0 ? Long.MAX_VALUE : idleTimeoutMillis));
         this.metrics = metrics;
         this.recordsOut = metrics.counter("records-out");
     }
@@ -81,6 +104,7 @@ public final class SourceTask implements Runnable {
             boolean moreAvailable = true;
             while (running && moreAvailable) {
                 moreAvailable = source.poll(collector);
+                emitPeriodicWatermark();
                 // Ship whatever this poll produced rather than holding a partial buffer until
                 // the next one fills it. A source that polls every 200ms and batches by size
                 // alone would add the poll interval to every record's latency.
@@ -172,12 +196,43 @@ public final class SourceTask implements Runnable {
         @Override
         public void collect(Object value, long timestamp) {
             try {
+                if (watermarkGenerator.isPresent()) {
+                    BoundedOutOfOrdernessGenerator generator = watermarkGenerator.get();
+                    boolean wasIdle = generator.isIdle();
+                    generator.onEvent(timestamp);
+                    if (wasIdle) {
+                        // A record alone cannot revive a downstream channel: its watermark
+                        // state is tracked independently of the data path.
+                        output.broadcast(Watermark.active());
+                    }
+                }
                 output.emit(new StreamRecord<>(value, timestamp));
                 recordsOut.increment();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new TaskCancelledException("cancelled while emitting from source");
             }
+        }
+    }
+
+    private void emitPeriodicWatermark() throws InterruptedException {
+        if (watermarkGenerator.isEmpty()) {
+            return;
+        }
+        BoundedOutOfOrdernessGenerator generator = watermarkGenerator.get();
+        boolean wasIdle = generator.isIdle();
+        Optional<Watermark> watermark = generator.onPeriodicEmit();
+        if (!wasIdle && generator.isIdle()) {
+            output.broadcast(Watermark.idle());
+        } else {
+            watermark.ifPresent(value -> {
+                try {
+                    output.broadcast(value);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new TaskCancelledException("cancelled while emitting a watermark");
+                }
+            });
         }
     }
 }

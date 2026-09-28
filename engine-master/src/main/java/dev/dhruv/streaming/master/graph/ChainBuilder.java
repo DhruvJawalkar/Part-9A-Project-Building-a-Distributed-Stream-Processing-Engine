@@ -1,6 +1,7 @@
 package dev.dhruv.streaming.master.graph;
 
 import dev.dhruv.streaming.api.ExchangeStrategy;
+import dev.dhruv.streaming.api.KeyedOperator;
 import dev.dhruv.streaming.api.graph.JobGraph;
 import dev.dhruv.streaming.api.graph.LogicalOperator;
 import dev.dhruv.streaming.api.graph.SinkNode;
@@ -111,6 +112,13 @@ public final class ChainBuilder {
         if (inputExchangeOf(successor) != ExchangeStrategy.FORWARD) {
             return Optional.empty();          // condition 1
         }
+        if (isKeyed(operator) || isKeyed(successor)) {
+            // A keyed runtime owns its state backend, current-key context and timer service.
+            // OperatorChain intentionally has one shared context, so fusing across this
+            // boundary would silently give neighbouring operators the keyed operator's state.
+            // Keep it a task boundary until contexts are namespaced per chained operator.
+            return Optional.empty();
+        }
         return Optional.of(successor);
     }
 
@@ -126,6 +134,16 @@ public final class ChainBuilder {
             case TransformNode transform -> transform.inputExchange();
             case SinkNode sink -> sink.inputExchange();
             case SourceNode ignored -> ExchangeStrategy.FORWARD;
+        };
+    }
+
+    private static boolean isKeyed(LogicalOperator operator) {
+        return switch (operator) {
+            case TransformNode transform -> transform.keySelector().isPresent()
+                    || transform.operator() instanceof KeyedOperator<?, ?, ?>;
+            case SinkNode sink -> sink.keySelector().isPresent()
+                    || sink.operator() instanceof KeyedOperator<?, ?, ?>;
+            case SourceNode ignored -> false;
         };
     }
 }

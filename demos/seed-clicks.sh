@@ -3,9 +3,9 @@
 # Publishes the click fixture to lms.catalog.clicks.
 #
 # The fixture is a fixed file rather than generated traffic on purpose. Every demo in this
-# project has to be reproducible -- the determinism test in Phase 4 compares a recovered run
-# against a clean one byte for byte, which is only a meaningful comparison if both runs read
-# exactly the same input.
+# project has to be reproducible -- the Phase 3 acceptance test compares repeated runs byte for
+# byte, and the recovery test in Phase 4 compares a recovered run with a clean one. Neither
+# comparison is meaningful unless both runs read exactly the same input.
 #
 #   ./demos/seed-clicks.sh                     publish the standard fixture
 #   ./demos/seed-clicks.sh path/to/other.jsonl publish a different one
@@ -31,15 +31,16 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
 fi
 
 echo "What to watch for:"
-echo "  The job prints one line per surviving click event."
 echo "  Of the $(wc -l < "$FIXTURE") events in the fixture, BotFilter drops five:"
 echo "    3 from bot-* member ids, 1 with a blank member id, 1 with no event time."
-echo "  Expect 15 lines on the job's terminal."
+echo "  The remaining clicks are grouped into five member sessions."
+echo "  A session is emitted only after event time advances past its 15-minute gap;"
+echo "  the bounded fixture alone intentionally leaves those sessions open."
 echo
 
 # --property parse.key + key.separator is what puts a member's events in one partition.
 # Kafka hashes the key to pick a partition, so per-member ordering holds within a partition,
-# which is what the session aggregator will rely on in Phase 3.
+# which is what the session aggregator relies on.
 sed 's/^{"memberId":"\([^"]*\)".*/\1\t&/' "$FIXTURE" \
   | docker exec -i "$CONTAINER" /opt/kafka/bin/kafka-console-producer.sh \
       --bootstrap-server localhost:19092 \

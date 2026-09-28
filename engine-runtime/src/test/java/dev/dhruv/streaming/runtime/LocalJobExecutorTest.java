@@ -21,6 +21,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.time.Duration;
 import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -139,19 +142,25 @@ class LocalJobExecutorTest {
     }
 
     @Test
-    @DisplayName("refuses a hash exchange, naming the phase that adds it")
-    void hashExchangeIsRejected() {
+    @DisplayName("routes a hash exchange through the keyed task")
+    void hashExchangeRoutesToKeyedTask() throws Exception {
         JobGraph.Builder job = JobGraph.named("keyed");
-        job.source("in", new ListSource(List.of("a")))
+        job.source("in", new ListSource(List.of("a", "b", "a", "c"))).parallelism(2)
                 .keyBy("by-value", value -> value)
-                .process("keyed-op", new PassThroughKeyedOperator())
-                .sink("out", new CollectingSink("keyed"));
+                .process("keyed-op", new PassThroughKeyedOperator()).parallelism(2)
+                .sink("out", new CollectingSink("keyed")).parallelism(2);
 
-        JobExecutor executor = new LocalJobExecutor(job.build());
+        runToCompletion(job.build());
 
-        assertThatThrownBy(executor::start)
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("Phase 3");
+        assertThat(COLLECTED.get("keyed")).containsExactlyInAnyOrder("a", "b", "a", "c");
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("a silent source channel no longer stalls event-time progress after idleness")
+    void idlenessUnblocksTheLocalExecutorWatermarkMinimum() throws Exception {
+        assertThat(runWithOptionalIdleness(Duration.ZERO)).isFalse();
+        assertThat(runWithOptionalIdleness(Duration.ofMillis(10))).isTrue();
     }
 
     @Test
@@ -182,6 +191,26 @@ class LocalJobExecutorTest {
             executor.start();
             executor.awaitTermination();
             return executor.metrics();
+        } finally {
+            executor.close();
+        }
+    }
+
+    private static boolean runWithOptionalIdleness(Duration idleTimeout) throws Exception {
+        CountDownLatch watermarkObserved = WatermarkObservingOperator.newLatch();
+        JobGraph.Builder job = JobGraph.named("idleness-" + idleTimeout.toMillis());
+        job.source("in", new OneSilentPartitionSource()).parallelism(2)
+                .withEventTime(value -> value.timestamp(), Duration.ZERO)
+                .withIdleness(idleTimeout)
+                // A narrower operator forces the two source subtasks into distinct input
+                // channels, which is where the watermark minimum and idleness matter.
+                .process("observe", new WatermarkObservingOperator()).parallelism(1)
+                .sink("out", (record, out) -> { }).parallelism(1);
+
+        LocalJobExecutor executor = new LocalJobExecutor(job.build());
+        try {
+            executor.start();
+            return watermarkObserved.await(500, TimeUnit.MILLISECONDS);
         } finally {
             executor.close();
         }
@@ -280,6 +309,58 @@ class LocalJobExecutorTest {
 
         @Override
         public void onEventTimer(long timestamp, String key, Collector<String> out) {
+        }
+    }
+
+    private record TimedValue(String value, long timestamp) implements java.io.Serializable {
+    }
+
+    /** Subtask zero advances event time; subtask one stays alive but produces no events. */
+    private static final class OneSilentPartitionSource implements Source<TimedValue> {
+        private transient int subtask;
+        private transient int poll;
+
+        @Override
+        public void open(SourceContext context) {
+            subtask = context.subtaskIndex();
+        }
+
+        @Override
+        public boolean poll(Collector<TimedValue> out) throws InterruptedException {
+            if (subtask == 1) {
+                return true;
+            }
+            if (poll++ == 0) {
+                out.collect(new TimedValue("first", 100), 100);
+                return true;
+            }
+            Thread.sleep(60);
+            out.collect(new TimedValue("advance", 1_000), 1_000);
+            return false;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private static final class WatermarkObservingOperator implements Operator<TimedValue, TimedValue> {
+        private static volatile CountDownLatch observed;
+
+        static CountDownLatch newLatch() {
+            observed = new CountDownLatch(1);
+            return observed;
+        }
+
+        @Override
+        public void processElement(StreamRecord<TimedValue> record, Collector<TimedValue> out) {
+        }
+
+        @Override
+        public void onWatermark(long watermark, Collector<TimedValue> out) {
+            if (watermark >= 1_000) {
+                observed.countDown();
+            }
         }
     }
 

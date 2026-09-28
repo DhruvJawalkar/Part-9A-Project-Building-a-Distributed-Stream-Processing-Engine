@@ -24,7 +24,7 @@ import java.util.List;
  * the sealed hierarchy survive the wire: a receiver reads one byte and knows whether the next
  * eight are a watermark's timestamp or the start of a user object.
  *
- * <p>The asymmetry between the three cases is worth noticing. A watermark costs nine bytes and a
+ * <p>The asymmetry between the three cases is worth noticing. A watermark costs ten bytes and a
  * barrier seventeen, because both are just longs; a data record costs whatever Java
  * serialization makes of the user's object, which is typically hundreds of bytes and a great
  * deal more work. Control elements travelling in band with data is therefore close to free,
@@ -78,6 +78,7 @@ public final class StreamElementSerializer {
                     case Watermark watermark -> {
                         out.writeByte(TAG_WATERMARK);
                         out.writeLong(watermark.timestamp());
+                        out.writeByte(watermark.status().ordinal());
                     }
                     case CheckpointBarrier barrier -> {
                         out.writeByte(TAG_BARRIER);
@@ -110,7 +111,15 @@ public final class StreamElementSerializer {
                         in.readFully(value);
                         elements.add(new StreamRecord<>(deserializeValue(value), timestamp));
                     }
-                    case TAG_WATERMARK -> elements.add(new Watermark(in.readLong()));
+                    case TAG_WATERMARK -> {
+                        long timestamp = in.readLong();
+                        int status = in.readUnsignedByte();
+                        Watermark.Status[] statuses = Watermark.Status.values();
+                        if (status >= statuses.length) {
+                            throw new IOException("unknown watermark status " + status);
+                        }
+                        elements.add(new Watermark(timestamp, statuses[status]));
+                    }
                     case TAG_BARRIER ->
                             elements.add(new CheckpointBarrier(in.readLong(), in.readLong()));
                     default -> throw new IOException(

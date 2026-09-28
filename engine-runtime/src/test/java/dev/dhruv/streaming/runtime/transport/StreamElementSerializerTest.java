@@ -29,6 +29,7 @@ class StreamElementSerializerTest {
         List<StreamElement> original = List.of(
                 new StreamRecord<>(new ClickLike("m-1001", "cat-7741"), 1757836800000L),
                 new Watermark(1757836795000L),
+                Watermark.idle(),
                 new StreamRecord<>(new ClickLike("m-1002", "cat-3390"), 1757836820000L),
                 new CheckpointBarrier(42L, 1757836830000L));
 
@@ -55,7 +56,7 @@ class StreamElementSerializerTest {
     @Test
     @DisplayName("control elements are far cheaper than data records")
     void controlElementsAreCheap() throws IOException {
-        // Nine bytes for a watermark against hundreds for a record. This is what makes carrying
+        // Ten bytes for a watermark against hundreds for a record. This is what makes carrying
         // control elements in band with the data affordable in the first place.
         int watermarkBytes = StreamElementSerializer
                 .serialize(List.<StreamElement>of(new Watermark(1L))).length;
@@ -63,7 +64,7 @@ class StreamElementSerializerTest {
                 .serialize(List.<StreamElement>of(
                         new StreamRecord<>(new ClickLike("m-1001", "cat-7741"), 1L))).length;
 
-        assertThat(watermarkBytes).isEqualTo(9);
+        assertThat(watermarkBytes).isEqualTo(10);
         assertThat(recordBytes).isGreaterThan(watermarkBytes * 5);
     }
 

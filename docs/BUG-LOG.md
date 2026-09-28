@@ -22,13 +22,17 @@ happened. Which bugs a design lets you make is worth knowing.
 | [4](#4-grpc-context-cancellation-killed-the-record-streams) | 2 | gRPC `Context` cancellation killed the record streams | FIXED | Nearly |
 | [5](#5-operatorchain-zeroed-event-time) | 2 | `OperatorChain` zeroed event time | FIXED | Yes |
 | [6](#6-the-client-deployed-the-job-without-telling-the-master) | 2 | The client deployed the job without telling the master | FIXED | Yes |
+| [7](#7-a-silent-partition-stalled-event-time) | 3 | A silent partition stalled event time | FIXED | Yes |
+| [8](#8-an-idle-channel-could-make-max-look-safe) | 3 | An idle channel could make MAX look safe | FIXED | Yes |
+| [9](#9-keyed-state-crossed-an-operator-chain-boundary) | 3 | Keyed state crossed an operator-chain boundary | FIXED | Yes |
+| [10](#10-session-windows-merged-events-across-a-real-gap) | 3 | Session windows merged events across a real gap | FIXED | Yes |
 
 ### The pattern worth noticing
 
-**Four of six produced no error at all.** No exception, no failed health check, no red log line —
-just a job that was up, reported as `RUNNING`, and quietly not doing its work. Two of those (#3,
-#5) would have been reported as "the engine is slow" or "the windows are wrong" by anyone who did
-not already know where to look.
+**Eight of ten produced no error at all.** No exception, no failed health check, no red log line
+— just a job that was up, reported as `RUNNING`, and quietly not doing its work. The Phase 3
+entries are the classic forms: a window that never closes, a window that closes too early, or
+state attached to the wrong operator. All can look like an ordinary data-quality issue.
 
 That is the characteristic failure mode of a distributed stream processor, and it is the same
 shape as Demo 4 in Phase 7: *it fails while looking entirely healthy*. Worth remembering when
@@ -189,23 +193,106 @@ for reacting to failure has to be the one that knows what is running.
 
 ---
 
+## 7. A silent partition stalled event time
+
+**Phase 3 · FIXED · silent**
+
+One source subtask continued to produce records while another stayed connected but produced
+nothing. The downstream task took the minimum watermark across both channels, so the silent
+channel held the task clock at `Long.MIN_VALUE`. The job was healthy and consumed records, but no
+event-time timer or session window could ever fire.
+
+**The rule:** no input may be excluded merely because no message has arrived; on a distributed
+channel that absence is ambiguous. A source must explicitly report an idleness transition, and a
+downstream task must take the minimum only across active channels.
+
+- **Fix:** `BoundedOutOfOrdernessGenerator`, `SourceTask`, and `WatermarkTracker` —
+  `engine-runtime/.../runtime/`. The source broadcasts `Watermark.IDLE` after its configured
+  silence timeout, and `Watermark.ACTIVE` before the first resumed record.
+- **Test:** `LocalJobExecutorTest` — *"a silent source channel no longer stalls event-time
+  progress after idleness"* (:160). It first proves that no idleness stalls progress, then proves
+  that the same input progresses with a 10 ms idle timeout.
+
+---
+
+## 8. An idle channel could make MAX look safe
+
+**Phase 3 · FIXED · silent**
+
+After introducing idleness, treating `Watermark.MAX` as an ordinary per-channel watermark had a
+new failure mode: an idle channel was excluded from the minimum, so a different channel's EOF
+could advance the task to MAX. That fires all remaining timers and closes state even though a
+non-ended channel may still resume and deliver records.
+
+**The rule:** idleness is a liveness hint, not an end-of-input declaration. MAX is safe only when
+every physical input channel has announced EOF, regardless of its idle status.
+
+- **Fix:** `OperatorTask.handleWatermark` counts EOF markers per channel and calls
+  `WatermarkTracker.endOfAllInputs()` only after all have arrived. The ordinary tracker path
+  never treats an idle channel as permission to emit MAX.
+- **Coverage:** `OperatorTaskEventTimeTest` exercises timer flushing on MAX, while the task loop's
+  per-channel EOF bookkeeping makes the all-inputs condition explicit. A dedicated multi-input
+  EOF regression should remain part of the Phase 4 barrier-alignment coverage.
+
+---
+
+## 9. Keyed state crossed an operator-chain boundary
+
+**Phase 3 · FIXED · silent**
+
+The Phase 2 chain builder was allowed to fuse any equal-parallelism forward edge. A keyed
+operator now owns a current key, state backend and timer service; fusing an ordinary neighbour
+into that task would hand it the same context and state namespace. The records would still flow,
+but state names from two operator instances could silently address the same keyed store.
+
+**The rule:** a keyed task is an isolation boundary until the runtime namespaces state per
+operator inside a chain. Chaining is an optimisation; state scope is correctness.
+
+- **Fix:** `ChainBuilder.chainableSuccessorOf` rejects a chain whose upstream or successor is
+  keyed, even if the edge is otherwise forward and parallelism matches.
+- **Test:** `ChainBuilderTest` — *"condition 1: a hash exchange breaks the chain"* (:46) proves
+  the LMS-shaped keyed boundary is a separate chain group.
+
+---
+
+## 10. Session windows merged events across a real gap
+
+**Phase 3 · FIXED · silent**
+
+`SessionAggregator` accumulated every arrival for a member into its current state. If an event
+was later than the current session end by more than the 15-minute gap, it was nevertheless merged
+into that old session if the watermark had not yet advanced. The output looked plausible, but one
+member's distinct browsing visits became a single session.
+
+**The rule:** a session is defined in event time, not by the moment its timer happens to run. An
+event beyond the current end closes and resets the prior session; an event too old to merge with
+the current open session is counted/dropped. There is no allowed-lateness reopening policy yet.
+
+- **Fix:** `SessionAggregator` compares each event timestamp to the stored end before updating
+  its accumulator, emits/resets when it starts a new session, and drops unmergeably late input.
+- **Test:** `SessionAggregatorTest` covers extension, stale-timer suppression, state clearing,
+  and the gap/late-event rules.
+
+---
+
 ## Review notes
 
 Things noticed while fixing the above that are not bugs yet, but should be looked at when the log
 is reviewed.
 
-**R1 — `ChainedSourceOutput` timestamp handling is untested.** It mirrors `OperatorChain`'s
-`currentTimestamp` logic, which is where bug #5 lived. The code looks right; nothing proves it.
-Phase 3 is the natural time to cover it, because that is when a chained source first feeds
-something that cares about event time.
+**R1 — source-chain event-time callbacks need end-to-end coverage.** `ChainedSourceOutput` now
+passes an active watermark through its fused operators before forwarding it. That closes the
+Phase 2 timestamp gap in the code path, but a distributed source-chain/session test would make
+the proof stronger than the current local task-loop coverage.
 
 **R2 — `InputGate.onChannelDrained` is wired but unused.** Credit is granted from the gRPC handler
 after a whole buffer lands, not per element consumed. The hook exists for a more precise scheme.
 Decide in Phase 4 whether alignment makes the finer granularity worth having, or remove it.
 
-**R3 — Task failure reporting parses the task key with `split("#")`.** `WorkerBootstrap` splits a
-`operatorId#subtaskIndex` string to rebuild a `TaskId`. An operator id containing `#` would break
-it. Operator ids are user-supplied, so this is reachable; it just has not been reached.
+**R3 — Task identity parsing was corrected, but has no focused test.** `WorkerBootstrap` now
+splits the final `#` from `operatorId#subtaskIndex`, so a user-supplied operator id may itself
+contain `#`. Add a focused worker failure-reporting test when the Phase 4 recovery test harness
+exists.
 
 **R4 — `TaskTracker` cannot distinguish a dead worker from an unreachable one.** Not fixable —
 this is the failure detector problem — but the *consequence* changes by phase. In Phase 2 a

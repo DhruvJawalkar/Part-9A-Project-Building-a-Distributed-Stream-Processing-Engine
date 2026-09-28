@@ -1,6 +1,8 @@
 package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.CheckpointBarrier;
+import dev.dhruv.streaming.api.KeySelector;
+import dev.dhruv.streaming.api.KeyedOperator;
 import dev.dhruv.streaming.api.Operator;
 import dev.dhruv.streaming.api.StreamElement;
 import dev.dhruv.streaming.api.StreamRecord;
@@ -57,10 +59,15 @@ public final class OperatorTask implements Runnable {
     private final Output output;
     private final OutputCollector<Object> collector;
     private final RuntimeOperatorContext context;
+    private final InMemoryStateBackend stateBackend;
+    private final TimerService timerService;
+    private final WatermarkTracker watermarkTracker;
+    private final Optional<KeySelector<Object, Object>> keySelector;
     private final TaskMetricGroup metrics;
     private final Counter recordsIn;
 
     private int endOfStreamMarkersSeen;
+    private final boolean[] endOfStreamChannels;
     private volatile boolean running = true;
 
     /**
@@ -85,12 +92,33 @@ public final class OperatorTask implements Runnable {
                         InputGate inputGate,
                         Output output,
                         TaskMetricGroup metrics) {
+        this(taskId, operator, inputGate, output, Optional.empty(), metrics);
+    }
+
+    /**
+     * Creates a task whose optional selector is the same one used on the upstream hash edge.
+     * Keeping the selector at both points is intentional: routing and keyed state must agree
+     * even after user code has crossed a process boundary.
+     */
+    @SuppressWarnings("unchecked")
+    public OperatorTask(String taskId,
+                        Operator<?, ?> operator,
+                        InputGate inputGate,
+                        Output output,
+                        Optional<? extends KeySelector<?, ?>> keySelector,
+                        TaskMetricGroup metrics) {
         this.taskId = taskId;
         this.operator = (Operator<Object, Object>) operator;
         this.inputGate = inputGate;
         this.output = output;
         this.collector = new OutputCollector<>(output);
-        this.context = new RuntimeOperatorContext(metrics);
+        this.stateBackend = new InMemoryStateBackend();
+        this.timerService = new TimerService();
+        this.watermarkTracker = new WatermarkTracker(inputGate.channelCount());
+        this.endOfStreamChannels = new boolean[inputGate.channelCount()];
+        this.context = new RuntimeOperatorContext(metrics, stateBackend, timerService,
+                watermarkTracker);
+        this.keySelector = (Optional<KeySelector<Object, Object>>) keySelector;
         this.metrics = metrics;
         this.recordsIn = metrics.counter("records-in");
     }
@@ -137,10 +165,15 @@ public final class OperatorTask implements Runnable {
     }
 
     private void processRecord(StreamRecord<?> record) throws Exception {
-        // Phase 3 restores the key context here, once there is keyed state for it to scope:
-        //     if (keySelector != null) {
-        //         stateBackend.setCurrentKey(keySelector.getKey(record.value()));
-        //     }
+        if (keySelector.isPresent()) {
+            Object key = keySelector.get().getKey(record.value());
+            if (key == null) {
+                throw new IllegalArgumentException("key selector for task '" + taskId
+                        + "' returned null");
+            }
+            stateBackend.setCurrentKey(key);
+            context.setCurrentKey(key);
+        }
         collector.setCurrentTimestamp(record.timestamp());
         operator.processElement(asObjectRecord(record), collector);
         recordsIn.increment();
@@ -163,19 +196,66 @@ public final class OperatorTask implements Runnable {
      * a task's own clock can only follow from all of its channels together.
      */
     private void handleWatermark(Watermark watermark, int channelIndex) throws Exception {
-        if (watermark.timestamp() != Watermark.MAX.timestamp()) {
-            output.broadcast(watermark);
+        if (!watermark.isIdle() && watermark.timestamp() == Watermark.MAX.timestamp()) {
+            if (!endOfStreamChannels[channelIndex]) {
+                endOfStreamChannels[channelIndex] = true;
+                endOfStreamMarkersSeen++;
+                // An ended input is terminal MAX in this task's minimum, so it no longer holds
+                // back watermarks from inputs that are still producing. This is deliberately
+                // different from forwarding MAX: an idle input may still revive, and the task
+                // itself must only finish after every channel has ended.
+                watermarkTracker.endOfInput(channelIndex).ifPresent(value -> {
+                    try {
+                        forwardProgressedWatermark(value);
+                    } catch (Exception e) {
+                        throw new WatermarkHandlingException(e);
+                    }
+                });
+            }
+            if (endOfStreamMarkersSeen == inputGate.channelCount()) {
+                watermarkTracker.endOfAllInputs().ifPresent(value -> {
+                    try {
+                        forwardProgressedWatermark(value);
+                    } catch (Exception e) {
+                        throw new WatermarkHandlingException(e);
+                    }
+                });
+                output.flush();
+                running = false;
+            }
             return;
         }
 
-        endOfStreamMarkersSeen++;
-        if (endOfStreamMarkersSeen < inputGate.channelCount()) {
-            return;
+        boolean allInputsWereIdle = watermarkTracker.allInputsIdle();
+        Optional<Watermark> progressed = watermarkTracker.onWatermark(channelIndex, watermark);
+        boolean allInputsAreIdle = watermarkTracker.allInputsIdle();
+
+        // A status transition is useful even when it cannot advance this task's clock. A
+        // downstream multi-input task otherwise has no way to distinguish a silent upstream
+        // task from one whose own inputs are all idle.
+        if (allInputsWereIdle != allInputsAreIdle) {
+            output.broadcast(allInputsAreIdle ? Watermark.idle() : Watermark.active());
         }
-        // Every channel has finished. Pass the news on and stop.
-        output.broadcast(Watermark.MAX);
-        output.flush();
-        running = false;
+        if (progressed.isPresent()) {
+            forwardProgressedWatermark(progressed.get());
+        }
+
+    }
+
+    private void forwardProgressedWatermark(Watermark watermark) throws Exception {
+        timerService.advanceTo(watermark.timestamp(), stateBackend, (timestamp, key) -> {
+            if (operator instanceof KeyedOperator<?, ?, ?> keyed) {
+                @SuppressWarnings("unchecked")
+                KeyedOperator<Object, Object, Object> typed =
+                        (KeyedOperator<Object, Object, Object>) keyed;
+                collector.setCurrentTimestamp(timestamp);
+                context.setCurrentKey(key);
+                typed.onEventTimer(timestamp, key, collector);
+            }
+        });
+        collector.setCurrentTimestamp(watermark.timestamp());
+        operator.onWatermark(watermark.timestamp(), collector);
+        output.broadcast(watermark);
     }
 
     /**
@@ -245,10 +325,17 @@ public final class OperatorTask implements Runnable {
             log.warn("task {} failed to close its operator cleanly", taskId, e);
         }
         output.close();
+        stateBackend.close();
     }
 
     @SuppressWarnings("unchecked")
     private static StreamRecord<Object> asObjectRecord(StreamRecord<?> record) {
         return (StreamRecord<Object>) record;
+    }
+
+    private static final class WatermarkHandlingException extends RuntimeException {
+        private WatermarkHandlingException(Exception cause) {
+            super(cause);
+        }
     }
 }
