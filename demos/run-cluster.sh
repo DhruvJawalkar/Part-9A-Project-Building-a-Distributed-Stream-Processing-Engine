@@ -4,7 +4,7 @@
 #
 # What to watch for:
 #   1. Three workers register and appear in etcd under /workers/.
-#   2. A submitted job compiles to 6 tasks spread across all three workers.
+#   2. The session and conversion branches are spread across all three workers.
 #
 # Ports: master 7000, worker control 7001-7003, worker data 7101-7103. Deliberately clear of
 # 9092, which Kafka takes.
@@ -90,7 +90,7 @@ for i in 1 2 3; do
   WORKER_HOST=localhost \
   WORKER_RPC_PORT=$rpc \
   WORKER_DATA_PORT=$data \
-  WORKER_SLOTS=8 \
+  WORKER_SLOTS="${WORKER_SLOTS:-12}" \
   MASTER_HOST=localhost \
   MASTER_PORT=7000 \
   ETCD_ENDPOINTS=http://localhost:2379 \

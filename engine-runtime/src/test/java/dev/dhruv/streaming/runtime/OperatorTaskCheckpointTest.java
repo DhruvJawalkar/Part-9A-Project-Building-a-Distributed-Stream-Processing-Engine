@@ -2,6 +2,8 @@ package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.CheckpointBarrier;
 import dev.dhruv.streaming.api.Collector;
+import dev.dhruv.streaming.api.Either;
+import dev.dhruv.streaming.api.IntervalJoinOperator;
 import dev.dhruv.streaming.api.KeySelector;
 import dev.dhruv.streaming.api.KeyedOperator;
 import dev.dhruv.streaming.api.Operator;
@@ -119,6 +121,57 @@ class OperatorTaskCheckpointTest {
     }
 
     @Test
+    void restoresIntervalJoinBuffersAndTheirWatermarkCleanupTimers() throws Exception {
+        KeySelector<Either<String, String>, String> selector = ignored -> "member-item";
+        InputGate firstGate = new InputGate(1);
+        OperatorTask first = new OperatorTask("join#0", stringJoin(), firstGate,
+                new RecordingOutput(), Optional.of(selector), new InMemoryStateBackend(),
+                temporaryDirectory.resolve("join-first"), new TaskMetricGroup("join", 0));
+        CountDownLatch snapshotted = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<OperatorTask.CheckpointResult> checkpoint =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        first.onCheckpoint(result -> {
+            checkpoint.set(result);
+            snapshotted.countDown();
+        });
+
+        Thread firstThread = new Thread(first, "join-before-recovery");
+        firstThread.start();
+        firstGate.enqueue(0, new StreamRecord<>(Either.left("click"), 100));
+        firstGate.enqueue(0, new CheckpointBarrier(7, 101));
+        assertThat(snapshotted.await(2, TimeUnit.SECONDS)).isTrue();
+        first.cancel();
+        firstThread.join(2_000);
+
+        InputGate restoredGate = new InputGate(1);
+        RecordingOutput restoredOutput = new RecordingOutput();
+        TaskMetricGroup restoredMetrics = new TaskMetricGroup("join", 0);
+        OperatorTask restored = new OperatorTask("join#0", stringJoin(), restoredGate,
+                restoredOutput, Optional.of(selector), new InMemoryStateBackend(),
+                temporaryDirectory.resolve("join-restored"), restoredMetrics);
+        restored.restore(checkpoint.get().stateHandle());
+        Thread restoredThread = new Thread(restored, "join-after-recovery");
+        restoredThread.start();
+
+        restoredGate.enqueue(0, new StreamRecord<>(Either.right("borrow"), 130));
+        awaitRecord(restoredOutput.elements, "click/borrow");
+        assertThat(restoredMetrics.snapshot())
+                .containsEntry("left-buffer-size", 1L)
+                .containsEntry("right-buffer-size", 1L);
+
+        // The left cleanup timer at 131 was registered before the checkpoint. The restored
+        // right record only registers a timer at 161, so draining the left side here proves the
+        // earlier timer was included in the task envelope and restored with its keyed state.
+        restoredGate.enqueue(0, new Watermark(131));
+        awaitMetric(restoredMetrics, "left-buffer-size", 0);
+        assertThat(restoredMetrics.snapshot()).containsEntry("right-buffer-size", 1L);
+
+        restoredGate.enqueue(0, Watermark.MAX);
+        restoredThread.join(2_000);
+        assertThat(restoredThread.isAlive()).isFalse();
+    }
+
+    @Test
     void coordinatorAbortReleasesAChannelAndAllowsTheNextCheckpoint() throws Exception {
         InputGate gate = new InputGate(2);
         RecordingOutput output = new RecordingOutput();
@@ -198,6 +251,35 @@ class OperatorTaskCheckpointTest {
         while (!values.contains(expected) && System.nanoTime() < deadline) {
             Thread.sleep(10);
         }
+    }
+
+    private static void awaitRecord(List<StreamElement> elements, Object expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            if (elements.stream().filter(StreamRecord.class::isInstance)
+                    .map(StreamRecord.class::cast)
+                    .anyMatch(record -> expected.equals(record.value()))) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertThat(elements).anyMatch(element -> element instanceof StreamRecord<?> record
+                && expected.equals(record.value()));
+    }
+
+    private static void awaitMetric(TaskMetricGroup metrics, String name, long expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (metrics.snapshot().getOrDefault(name, Long.MIN_VALUE) != expected
+                && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(metrics.snapshot()).containsEntry(name, expected);
+    }
+
+    private static IntervalJoinOperator<String, String, String, String> stringJoin() {
+        return new IntervalJoinOperator<>(0, 30, (left, right) -> left + "/" + right);
     }
 
     private static void awaitBlockedChannels(InputGate gate, int expected)

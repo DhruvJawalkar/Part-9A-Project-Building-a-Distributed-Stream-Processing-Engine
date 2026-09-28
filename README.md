@@ -2,7 +2,8 @@
 
 A teaching implementation of a distributed stream processing engine in Java 21. It runs master
 and worker processes, routes records over gRPC, processes keyed streams in event time, and recovers
-the whole job from coordinated checkpoints. Transactional Iceberg output remains a later phase.
+the whole job from coordinated checkpoints. It also includes a keyed event-time interval join;
+transactional Iceberg output remains a later phase.
 
 It accompanies **Part 9A: Stream Processing Fundamentals** of the *Developing Intuition on
 Building Blocks — Systems Design* series. The article explains how an engine like this works;
@@ -35,7 +36,7 @@ implementation stops is part of understanding what production engines do for you
 | **2** | Master and worker processes, gRPC transport, etcd | **Complete** |
 | **3** | Event time, watermarks, keyed state, session windows | **Complete** |
 | **4** | Checkpointing, barrier alignment, portable state, recovery | **Complete** |
-| 5 | The interval join | Planned |
+| **5** | Two-stream event-time interval join and conversion branch | **Complete** |
 | 6 | Transactional Iceberg sink | Planned |
 | 7 | Status API and the four demos | Planned |
 
@@ -48,15 +49,17 @@ Requires **JDK 21+** and **Docker**.
 ```bash
 docker compose up -d          # Kafka, etcd and MinIO; topics are created with 4 partitions
 ./demos/run-cluster.sh        # master on :7000 and three workers on :7001-7003
-./demos/seed-clicks.sh        # publish the click fixture
+./demos/seed-clicks.sh        # publish clicks
+./demos/seed-borrows.sh       # publish borrows; either fixture can be seeded first
 ./gradlew :lms-job:submitToCluster
-./demos/run-cluster.sh stop
 ```
 
-The job prints `SessionRow` values when the event-time watermark reaches the session end. Kafka
-partition positions are owned by the engine: the next offset is captured in each source
-checkpoint, and recovery seeks to that offset without relying on broker-committed consumer-group
-positions. Run the full unit suite with `./gradlew test`. The focused Phase 3 proof is:
+The job has two outputs: `SessionRow` values when a session closes and `ConversionRow` values for
+a `RESULT_CLICK` followed by a matching borrow within 30 event-time minutes. Both input fixtures
+are deterministic, and click/borrow arrival order does not change the join result. Kafka partition
+positions are owned by the engine: the next offset is captured in each source checkpoint, and
+recovery seeks to that offset without relying on broker-committed consumer-group positions. Run
+the full unit suite with `./gradlew test`. The focused Phase 3 proof is:
 
 ```bash
 ./gradlew :engine-runtime:test :lms-job:test :engine-connectors:test
@@ -66,7 +69,11 @@ It covers bounded out-of-orderness, the silent-partition/idleness regression, ke
 state, timer key restoration, session extension, stale-timer suppression, state clearing, and
 deterministic file replay. Phase 4 checkpoint unit, integration, and recovery acceptance tests
 run through Gradle; the Docker-backed MinIO check is
-`./gradlew :engine-worker:integrationTest`. Tear everything down with
+`./gradlew :engine-worker:integrationTest`. The Phase 5 join tests run with `./gradlew :engine-api:test`
+and the LMS fixture replay with `./gradlew :lms-job:test`.
+
+Keep the cluster running while you inspect the session and conversion output in `demos/logs/`.
+When finished, stop the workers with `./demos/run-cluster.sh stop`, then stop dependencies with
 `docker compose down -v`.
 
 ### A note on output ordering
@@ -92,12 +99,12 @@ The dependency direction is strict and enforced by Gradle rather than by convent
 ```
 engine-api/          No runtime dependencies, ever. StreamElement, Operator, KeyedOperator,
                      OperatorContext, state interfaces, JobGraph builder, ExchangeStrategy,
-                     KeyGroupAssigner.
+                     KeyGroupAssigner, Either, DataStream.union, IntervalJoinOperator.
 engine-rpc/          No engine dependencies. The .proto wire contracts and generated stubs.
 engine-metadata/     No engine dependencies. MetadataStore, etcd and in-memory implementations.
 engine-runtime/      → engine-api, engine-rpc
                      Task run loop, event time, keyed state and timers, input gates, transport,
-                     serialization.
+                     FanOutOutput and serialization.
 engine-master/       → engine-api, engine-rpc, engine-metadata, engine-runtime
                      JobMaster, ExecutionGraph compiler, TaskTracker, JobClient.
 engine-worker/       → engine-api, engine-rpc, engine-metadata, engine-runtime
@@ -304,6 +311,49 @@ included source-position and operator-state envelopes.
 The focused `SessionPipelineRecoveryAcceptanceTest` also compares recovered source/session/sink
 execution with a clean fixed replay. The MinIO integration test restores an archive after deleting
 the producer's local checkpoint directory.
+
+---
+
+## What Phase 5 built
+
+The LMS job now has two event-time branches. Clean clicks still feed session aggregation; result
+clicks also join with borrows keyed by `ConversionKey(memberId, catalogItemId)`:
+
+```text
+clicks → drop-bots ──┬── keyBy(memberId) → SessionAggregator → session console
+                     └── RESULT_CLICK → Either.left ───────────┐
+borrows ───────────────────────────────→ Either.right ─────────┤
+                                                               └─ union(REBALANCE)
+                                                                  → keyBy(ConversionKey)
+                                                                  → IntervalJoinOperator
+                                                                  → conversion console
+```
+
+`engine-api` exposes the sealed `Either<L,R>` tag, `JoinFunction`, and keyed
+`IntervalJoinOperator<K,L,R,O>`. Each tagged arrival checks the opposite side's keyed `ListState`,
+emits one row for every match, then buffers itself. Thus either stream can arrive first and each
+matching pair emits exactly once when its second member arrives. The LMS interval is inclusive:
+`0 <= borrowTime - resultClickTime <= 30 minutes`.
+
+The join retains separate left and right `ListState`s per `ConversionKey`. Event-time timers remove
+left records only when `leftTime + upperBound < watermark`, and right records only when
+`rightTime < watermark - upperBound` for this forward 0..30-minute interval. These strict
+inequalities keep matches at either inclusive endpoint available; cleanup occurs only after the
+watermark has passed the final possible match time. `left-buffer-size` and `right-buffer-size`
+gauges expose the retained records independently.
+
+`DataStream.union` creates a transparent fan-in node, preserves record timestamps, and uses
+`REBALANCE`: two input branches need not have a one-to-one subtask correspondence, so `FORWARD`
+would be ambiguous. A union is a multi-input task boundary, with a distinct `InputGate` channel
+for each upstream operator/subtask. Watermarks and checkpoint barriers therefore remain associated
+with their own branch. At a producer with multiple downstream branches, runtime `FanOutOutput`
+hands each edge its own routed output so the session and conversion paths keep their own exchange
+strategy and key selector.
+
+`demos/fixtures/borrows.jsonl` and `demos/seed-borrows.sh` provide deterministic conversion input.
+Seed the click and borrow fixtures in either order; the keyed join buffers whichever side arrives
+first. The fixture includes a borrow just beyond the 30-minute upper bound to make the eviction
+boundary observable.
 
 ---
 

@@ -1,6 +1,6 @@
 # Engine design
 
-This living design document records what is implemented through **Phase 4** and labels later
+This living design document records what is implemented through **Phase 5** and labels later
 work as **planned**. This is a teaching engine: its source shows the mechanism directly instead
 of hiding it behind a production framework.
 
@@ -15,7 +15,7 @@ authoritative build sequence is in [CLAUDE.md](../CLAUDE.md).
 | 2 | Complete | Master/worker deployment, etcd, gRPC transport and failure detection |
 | 3 | Complete | Event time, watermarks/idleness, keyed state/timers and sessions |
 | 4 | Complete | Aligned checkpoints, RocksDB state, MinIO archives and whole-job recovery |
-| 5 | **Planned** | Event-time interval join |
+| 5 | Complete | Tagged two-stream interval join and LMS conversion branch |
 | 6 | **Planned** | Transactional Iceberg output |
 | 7 | **Planned** | Status API, dashboard and reproducible demos |
 
@@ -42,11 +42,14 @@ describe how a consumer receives input. Validation rejects cycles, unreachable o
 non-positive parallelism.
 
 ```text
-source("clicks") -- FORWARD --> filter("drop-bots")
-                                      |
-                                      | HASH by memberId
-                                      v
-                              process("sessions") -- REBALANCE --> sink("console")
+clicks -> drop-bots --+-- HASH by memberId -> sessions -> session console
+                      |
+                      +-- result-clicks -> tag-left --+
+                                                     +-- REBALANCE union
+borrows ---------------------------> tag-right ------+       |
+                                                             +-- HASH by ConversionKey
+                                                             +-- IntervalJoinOperator
+                                                             +-- conversion console
 ```
 
 `keyBy` does not create a node. It records a `KeySelector` and partition name on the next input
@@ -171,6 +174,42 @@ allowed-lateness reopening policy.
 `FileReplaySource` provides bounded JSON Lines input for deterministic replay. Stable line-hash
 partitioning gives the same source ownership on each replay with the same parallelism.
 
+## Phase 5 interval join and multi-input streams
+
+`engine-api` exposes `Either<L,R>` to tag records from two logical inputs, `JoinFunction` to map a
+matching pair, and `IntervalJoinOperator<K,L,R,O>` as a keyed event-time operator. The LMS job
+tags result clicks with `Either.left` and borrows with `Either.right`, then keys both by
+`ConversionKey(memberId, catalogItemId)` before the join.
+
+The LMS bounds are `[0, 30 minutes]` on `borrowTime - resultClickTime`, inclusive. Every arrival
+checks the opposite keyed buffer before being retained itself. This supports either arrival order
+and emits each matching pair once, when its second record arrives. Both sides use their own keyed
+`ListState` (`interval-join-left` and `interval-join-right`), with `left-buffer-size` and
+`right-buffer-size` gauges reporting the two retained populations independently.
+
+Each buffered record registers an event-time cleanup timer. For the LMS forward interval, a left
+record is removed only when `leftTime + upperBound < watermark`; a right record is removed only
+when `rightTime < watermark - upperBound`. Equality is still retained, so a match at exactly zero
+or exactly 30 minutes remains possible. Timers run under their original `ConversionKey`, and the
+callback checks the current watermark before filtering both state lists.
+
+`DataStream.union` creates a transparent transform with two upstream ids, forwards record values
+without changing timestamps, and sets `REBALANCE` on its inputs. Fan-in cannot use `FORWARD`
+because the branches may have different parallelisms and no unique subtask mapping. Union also
+forms a multi-input task boundary: each upstream operator/subtask has a distinct `InputGate`
+channel, so the runtime can track each branch's watermark and checkpoint barrier independently.
+
+When one producer fans out to session and conversion branches, `FanOutOutput` delegates to one
+edge-specific routed output per downstream. The edges therefore preserve independent routing and
+key selectors. The union input remains a single physical input to the interval operator after the
+two branches have converged.
+
+The borrow side has its own deterministic fixture in `demos/fixtures/borrows.jsonl`, published by
+`demos/seed-borrows.sh`. Seed it before or after clicks. If one input advances much faster, records
+from that side remain in its keyed list until the minimum input watermark passes their cleanup
+horizon. The slower stream therefore increases the fast side's buffer, a direct demonstration of
+the slower-stream effect.
+
 ## Checkpoint protocol and fault tolerance
 
 The master triggers checkpoints on a configurable interval (10 seconds by default) and allows a
@@ -276,7 +315,7 @@ worker loss mid-window, master loss, a late event and a hot key.
 ## Deliberate limitations
 
 There is one master, fixed parallelism, no savepoints, no dynamic rescaling, no SQL layer, and no
-security/multi-tenancy/resource isolation. Checkpoint recovery is implemented, but the console
-sink is not transactional; exactly-once external output awaits the Phase 6 Iceberg commit protocol.
-The interval join and operational APIs remain planned. These omissions are visible so the code
-shows which production-system mechanism solves each problem.
+security/multi-tenancy/resource isolation. Checkpoint recovery and interval joining are
+implemented, but the console sinks are not transactional; exactly-once external output awaits the
+Phase 6 Iceberg commit protocol. Operational APIs remain planned. These omissions are visible so
+the code shows which production-system mechanism solves each problem.

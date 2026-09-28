@@ -23,7 +23,9 @@ import dev.dhruv.streaming.runtime.SerializationUtil;
 import dev.dhruv.streaming.runtime.SourceTask;
 import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
 import dev.dhruv.streaming.runtime.transport.DataTransportClient;
+import dev.dhruv.streaming.runtime.transport.FanOutOutput;
 import dev.dhruv.streaming.runtime.transport.InputGate;
+import dev.dhruv.streaming.runtime.transport.Output;
 import dev.dhruv.streaming.runtime.transport.ResultPartitionWriter;
 import dev.dhruv.streaming.runtime.transport.ResultSubpartition;
 import dev.dhruv.streaming.runtime.transport.Subpartitions;
@@ -182,7 +184,7 @@ public final class TaskManager implements AutoCloseable {
         InputGate gate = buildInputGate(deployment);
         inputRegistry.register(headOperatorId, subtask, gate, senderChannels(deployment));
 
-        ResultPartitionWriter output = buildOutput(deployment, headOperatorId, subtask);
+        Output output = buildOutput(deployment, headOperatorId, subtask);
         TaskMetricGroup metrics = new TaskMetricGroup(headOperatorId, subtask);
 
         Runnable task = deployment.getOperators(0).getKind() == OperatorKind.OPERATOR_SOURCE
@@ -232,9 +234,9 @@ public final class TaskManager implements AutoCloseable {
         return channels;
     }
 
-    private ResultPartitionWriter buildOutput(TaskDeployment deployment,
-                                              String headOperatorId,
-                                              int subtaskIndex) {
+    private Output buildOutput(TaskDeployment deployment,
+                               String headOperatorId,
+                               int subtaskIndex) {
         List<OutputChannel> outputs = deployment.getOutputsList();
         if (outputs.isEmpty()) {
             return new ResultPartitionWriter(
@@ -248,24 +250,33 @@ public final class TaskManager implements AutoCloseable {
                 deployment.getOperatorsCount() - 1).getOperatorId();
         String senderTaskId = TaskInputRegistry.taskKey(tailOperatorId, subtaskIndex);
 
-        ExchangeStrategy exchange = toApi(outputs.getFirst().getExchange());
-        Optional<KeySelector<?, ?>> keySelector = SerializationUtil.fromBytesOrEmpty(
-                outputs.getFirst().getSerializedKeySelector().toByteArray());
-        List<ResultSubpartition> subpartitions = new ArrayList<>(outputs.size());
+        // A deployment lists one channel per downstream subtask. Keep all channels for one
+        // downstream operator together, but do not flatten different edges into one writer:
+        // their exchanges and key selectors are independent.
+        Map<String, List<OutputChannel>> channelsByDownstream = new LinkedHashMap<>();
         for (OutputChannel channel : outputs) {
-            subpartitions.add(openChannel(senderTaskId, channel, exchange, subtaskIndex));
+            channelsByDownstream.computeIfAbsent(channel.getDownstreamOperatorId(),
+                    ignored -> new ArrayList<>()).add(channel);
         }
-        return new ResultPartitionWriter(subpartitions, exchange, subtaskIndex,
-                keySelector.orElse(null));
+
+        List<Output> edgeOutputs = new ArrayList<>(channelsByDownstream.size());
+        for (List<OutputChannel> edgeChannels : channelsByDownstream.values()) {
+            OutputChannel edge = edgeChannels.getFirst();
+            ExchangeStrategy exchange = toApi(edge.getExchange());
+            Optional<KeySelector<?, ?>> keySelector = SerializationUtil.fromBytesOrEmpty(
+                    edge.getSerializedKeySelector().toByteArray());
+            List<ResultSubpartition> subpartitions = new ArrayList<>(edgeChannels.size());
+            for (OutputChannel channel : edgeChannels) {
+                subpartitions.add(openChannel(senderTaskId, channel));
+            }
+            edgeOutputs.add(new ResultPartitionWriter(subpartitions, exchange, subtaskIndex,
+                    keySelector.orElse(null)));
+        }
+        return edgeOutputs.size() == 1 ? edgeOutputs.getFirst() : new FanOutOutput(edgeOutputs);
     }
 
     private ResultSubpartition openChannel(String senderTaskId,
-                                           OutputChannel channel,
-                                           ExchangeStrategy exchange,
-                                           int senderSubtaskIndex) {
-        // Which of the destination's input channels this sender occupies. Under forward the
-        // destination has one input; otherwise every upstream subtask gets its own channel.
-        int channelIndex = exchange == ExchangeStrategy.FORWARD ? 0 : senderSubtaskIndex;
+                                           OutputChannel channel) {
 
         if (channel.getLocal()) {
             // Same worker: hand straight to the destination's gate. Registered already, because
@@ -292,7 +303,7 @@ public final class TaskManager implements AutoCloseable {
 
     private Runnable buildSourceTask(TaskDeployment deployment,
                                      String taskKey,
-                                     ResultPartitionWriter output,
+                                     Output output,
                                      TaskMetricGroup metrics) {
         ChainedOperator head = deployment.getOperators(0);
         Source<?> source = SerializationUtil.fromBytes(head.getSerializedOperator().toByteArray());
@@ -342,7 +353,7 @@ public final class TaskManager implements AutoCloseable {
     private Runnable buildOperatorTask(TaskDeployment deployment,
                                        String taskKey,
                                        InputGate gate,
-                                       ResultPartitionWriter output,
+                                       Output output,
                                        TaskMetricGroup metrics) {
         List<Operator<?, ?>> operators = new ArrayList<>();
         for (ChainedOperator operator : deployment.getOperatorsList()) {
@@ -530,7 +541,7 @@ public final class TaskManager implements AutoCloseable {
         bufferFlusher.shutdownNow();
     }
 
-    private static void flushQuietly(ResultPartitionWriter output) {
+    private static void flushQuietly(Output output) {
         try {
             output.flush();
         } catch (InterruptedException e) {

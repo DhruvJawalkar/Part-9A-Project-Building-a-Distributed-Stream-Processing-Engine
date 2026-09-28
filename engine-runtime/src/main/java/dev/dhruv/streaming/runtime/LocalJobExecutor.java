@@ -10,6 +10,7 @@ import dev.dhruv.streaming.api.graph.SourceNode;
 import dev.dhruv.streaming.api.graph.TransformNode;
 import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
 import dev.dhruv.streaming.runtime.transport.InputGate;
+import dev.dhruv.streaming.runtime.transport.FanOutOutput;
 import dev.dhruv.streaming.runtime.transport.Output;
 import dev.dhruv.streaming.runtime.transport.ResultPartitionWriter;
 import dev.dhruv.streaming.runtime.transport.ResultSubpartition;
@@ -166,28 +167,39 @@ public final class LocalJobExecutor implements JobExecutor {
         if (downstreamIds.isEmpty()) {
             return new ResultPartitionWriter(List.of(), ExchangeStrategy.FORWARD, subtaskIndex);
         }
-        if (downstreamIds.size() > 1) {
-            throw new UnsupportedOperationException(
-                    "operator '" + node.id() + "' fans out to " + downstreamIds
-                            + "; the local executor runs linear pipelines only");
-        }
+        List<Output> outputs = new ArrayList<>(downstreamIds.size());
+        for (String downstreamId : downstreamIds) {
+            LogicalOperator downstream = graph.operator(downstreamId).orElseThrow();
+            ExchangeStrategy exchange = inputExchangeOf(downstream);
 
-        String downstreamId = downstreamIds.getFirst();
-        LogicalOperator downstream = graph.operator(downstreamId).orElseThrow();
-        ExchangeStrategy exchange = inputExchangeOf(downstream);
-
-        // Which input channel this sender occupies at the receiver. Under forward the receiver
-        // has exactly one input, so channel zero. Otherwise every upstream subtask gets its own
-        // channel, which is what lets the receiver tell them apart -- and, from Phase 4, block
-        // them independently.
-        List<ResultSubpartition> subpartitions = new ArrayList<>();
-        List<InputGate> downstreamGates = inputGates.get(downstreamId);
-        int channelIndex = exchange == ExchangeStrategy.FORWARD ? 0 : subtaskIndex;
-        for (int target = 0; target < downstream.parallelism(); target++) {
-            subpartitions.add(Subpartitions.local(channelIndex, downstreamGates.get(target)));
+            // For a multi-input receiver, each upstream operator owns a contiguous range of
+            // channels. Without this offset, subtask zero of two upstreams both write channel
+            // zero while the receiver waits forever for their unused channels.
+            int channelIndex = exchange == ExchangeStrategy.FORWARD ? 0
+                    : senderChannelIndex(node, downstream, subtaskIndex);
+            List<ResultSubpartition> subpartitions = new ArrayList<>();
+            List<InputGate> downstreamGates = inputGates.get(downstreamId);
+            for (int target = 0; target < downstream.parallelism(); target++) {
+                subpartitions.add(Subpartitions.local(channelIndex, downstreamGates.get(target)));
+            }
+            outputs.add(new ResultPartitionWriter(subpartitions, exchange, subtaskIndex,
+                    keySelectorOf(downstream).orElse(null)));
         }
-        return new ResultPartitionWriter(subpartitions, exchange, subtaskIndex,
-                keySelectorOf(downstream).orElse(null));
+        return outputs.size() == 1 ? outputs.getFirst() : new FanOutOutput(outputs);
+    }
+
+    private int senderChannelIndex(LogicalOperator sender,
+                                   LogicalOperator downstream,
+                                   int senderSubtaskIndex) {
+        int precedingSubtasks = 0;
+        for (String upstreamId : downstream.upstreamIds()) {
+            if (upstreamId.equals(sender.id())) {
+                return precedingSubtasks + senderSubtaskIndex;
+            }
+            precedingSubtasks += graph.operator(upstreamId).orElseThrow().parallelism();
+        }
+        throw new IllegalArgumentException("operator '" + sender.id() + "' is not upstream of '"
+                + downstream.id() + "'");
     }
 
     private static ExchangeStrategy inputExchangeOf(LogicalOperator node) {

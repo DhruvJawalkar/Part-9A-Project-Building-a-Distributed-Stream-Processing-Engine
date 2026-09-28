@@ -131,6 +131,56 @@ public final class DataStream<T> {
     }
 
     /**
+     * Merges this stream with another stream of the same record type.
+     *
+     * <p>Union is a graph operation, not a user-code callback: it creates one transparent
+     * transform with both upstream ids and forwards each record unchanged, including its event
+     * timestamp. The input is always a {@link ExchangeStrategy#REBALANCE} edge. A forward edge
+     * cannot safely describe fan-in, because the two inputs may have different numbers of
+     * subtasks and there is no single upstream subtask that corresponds to a union subtask.
+     * Rebalancing also gives the downstream operator one channel for every upstream subtask, so
+     * its watermark is the minimum across both branches (subject to the usual idleness rules).
+     *
+     * <p>The union defaults to the larger upstream parallelism. This keeps every branch's
+     * capacity available without making the caller spell out a parallelism when the branches
+     * differ. As with every other stream, {@link #parallelism(int)} may override that default
+     * before the graph is built.
+     *
+     * <p>A union is intentionally not chainable: it has two upstreams, and the execution graph
+     * compiler keeps every multi-input operator at a task boundary so the inputs remain
+     * independently visible for watermarks and checkpoint barriers.
+     *
+     * @param id    stable operator id, unique within the job
+     * @param other the second stream to merge; it must come from this same job builder
+     * @return a handle to the merged records
+     * @throws NullPointerException    if {@code other} is null
+     * @throws InvalidJobGraphException if the streams belong to different job builders or are
+     *                                  the same stream
+     */
+    public DataStream<T> union(String id, DataStream<T> other) {
+        Objects.requireNonNull(other, "other");
+        if (builder != other.builder) {
+            throw new InvalidJobGraphException(
+                    "cannot union streams from different JobGraph builders; both streams must"
+                            + " belong to the same job");
+        }
+        if (node == other.node) {
+            throw new InvalidJobGraphException(
+                    "cannot union stream '" + node.id
+                            + "' with itself; provide two distinct upstream streams");
+        }
+
+        GraphNode next = builder.addNode(id, GraphNode.Kind.TRANSFORM);
+        next.operator = (Operator<T, T>) (record, out) ->
+                out.collect(record.value(), record.timestamp());
+        next.parallelism = Math.max(node.parallelism, other.node.parallelism);
+        next.upstreamIds.add(node.id);
+        next.upstreamIds.add(other.node.id);
+        next.inputExchange = ExchangeStrategy.REBALANCE;
+        return new DataStream<>(builder, next);
+    }
+
+    /**
      * Repartitions this stream by key, so that every record sharing a key reaches the same
      * downstream subtask.
      *

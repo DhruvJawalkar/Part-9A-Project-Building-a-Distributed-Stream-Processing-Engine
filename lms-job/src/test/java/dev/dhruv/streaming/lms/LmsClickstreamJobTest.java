@@ -6,6 +6,7 @@ import dev.dhruv.streaming.api.graph.LogicalOperator;
 import dev.dhruv.streaming.api.graph.SinkNode;
 import dev.dhruv.streaming.api.graph.SourceNode;
 import dev.dhruv.streaming.api.graph.TransformNode;
+import dev.dhruv.streaming.runtime.SerializationUtil;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -24,21 +25,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 class LmsClickstreamJobTest {
 
     @Test
-    @DisplayName("describes source, filter, session aggregation and sink")
+    @DisplayName("describes the session and click-to-borrow conversion branches")
     void graphShape() {
         JobGraph graph = LmsClickstreamJob.buildGraph();
 
         assertThat(graph.name()).isEqualTo("lms-clickstream");
         assertThat(graph.operators()).extracting(LogicalOperator::id)
-                .containsExactly("clicks", "drop-bots", "sessions", "console");
-        assertThat(graph.sources()).extracting(LogicalOperator::id).containsExactly("clicks");
-        assertThat(graph.sinks()).extracting(LogicalOperator::id).containsExactly("console");
+                .containsExactly("clicks", "borrows", "drop-bots", "sessions", "console",
+                        "result-clicks", "tag-result-clicks", "tag-borrows",
+                        "conversion-inputs", "conversions", "conversion-console");
+        assertThat(graph.sources()).extracting(LogicalOperator::id)
+                .containsExactly("clicks", "borrows");
+        assertThat(graph.sinks()).extracting(LogicalOperator::id)
+                .containsExactly("console", "conversion-console");
     }
 
     @Test
     @DisplayName("configures event time on the source")
     void eventTimeIsConfigured() {
-        SourceNode clicks = LmsClickstreamJob.buildGraph().sources().getFirst();
+        var sources = LmsClickstreamJob.buildGraph().sources();
+        SourceNode clicks = sources.getFirst();
+        SourceNode borrows = sources.get(1);
 
         assertThat(clicks.timestampAssigner())
                 .as("without an assigner, no window downstream could ever fire")
@@ -47,6 +54,9 @@ class LmsClickstreamJobTest {
         assertThat(clicks.idleTimeout())
                 .as("idleness must be configured, or one quiet partition stalls the whole job")
                 .isEqualTo(Duration.ofSeconds(30));
+        assertThat(borrows.timestampAssigner()).isPresent();
+        assertThat(borrows.outOfOrderness()).isEqualTo(Duration.ofSeconds(5));
+        assertThat(borrows.idleTimeout()).isEqualTo(Duration.ofSeconds(30));
     }
 
     @Test
@@ -63,8 +73,8 @@ class LmsClickstreamJobTest {
     @Test
     @DisplayName("narrows into the sink by rebalance rather than forward")
     void sinkNarrowsByRebalance() {
-        // Four filters into two sinks. A forward edge would leave filter subtasks 2 and 3 with
-        // nowhere to send, so the builder downgrades the edge.
+        // Four session subtasks into two sink subtasks. A forward edge would leave session
+        // subtasks 2 and 3 with nowhere to send, so the builder downgrades the edge.
         SinkNode console = LmsClickstreamJob.buildGraph().sinks().getFirst();
 
         assertThat(console.parallelism()).isEqualTo(2);
@@ -80,5 +90,35 @@ class LmsClickstreamJobTest {
         TransformNode sessionNode = (TransformNode) sessions;
         assertThat(sessionNode.inputExchange()).isEqualTo(ExchangeStrategy.HASH);
         assertThat(sessionNode.partitionName()).contains("by-member");
+    }
+
+    @Test
+    @DisplayName("unions tagged inputs before hashing conversions by member and item")
+    void conversionsAreAKeyedTwoSidedIntervalJoin() {
+        JobGraph graph = LmsClickstreamJob.buildGraph();
+        TransformNode union = (TransformNode) graph.operator("conversion-inputs").orElseThrow();
+        TransformNode conversions = (TransformNode) graph.operator("conversions").orElseThrow();
+
+        assertThat(union.upstreamIds())
+                .containsExactly("tag-result-clicks", "tag-borrows");
+        assertThat(union.inputExchange()).isEqualTo(ExchangeStrategy.REBALANCE);
+        assertThat(conversions.upstreamIds()).containsExactly("conversion-inputs");
+        assertThat(conversions.inputExchange()).isEqualTo(ExchangeStrategy.HASH);
+        assertThat(conversions.partitionName()).contains("by-member-and-item");
+        assertThat(conversions.operator())
+                .isInstanceOf(dev.dhruv.streaming.api.IntervalJoinOperator.class);
+    }
+
+    @Test
+    @DisplayName("serializes the complete two-branch job for remote submission")
+    void graphWithJoinIsSerializable() {
+        JobGraph graph = LmsClickstreamJob.buildGraph();
+
+        JobGraph restored = SerializationUtil.fromBytes(SerializationUtil.toBytes(graph));
+
+        assertThat(restored.operators()).extracting(LogicalOperator::id)
+                .containsExactlyElementsOf(graph.operators().stream()
+                        .map(LogicalOperator::id).toList());
+        assertThat(restored.operator("conversions")).isPresent();
     }
 }

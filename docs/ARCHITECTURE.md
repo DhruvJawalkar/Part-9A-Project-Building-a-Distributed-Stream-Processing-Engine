@@ -34,7 +34,7 @@ The target shape, from §4.1 of the companion PDF:
                         |                                       |
                   +-----------+                        +----------------+
                   |   Kafka   | source                 |   MinIO / S3   |
-                  +-----------+ (resettable offsets)   | ckpts + Iceberg|
+                  +-----------+ (checkpoint offsets)   | checkpoints    |
                                                        +----------------+
 ```
 
@@ -52,11 +52,11 @@ currently used for checkpoint archives.
 `LocalJobExecutor` remains, and is still the right tool for tests and demos -- a determinism test
 comparing two runs of one fixture does not get more convincing by involving three processes.
 
-The LMS job as Phase 3 actually schedules it. `clicks` and `drop-bots` fuse into one ordinary
-chain; the keyed `sessions` operator and narrower `console` sink are separate chain groups. The
-job therefore has ten task instances: four source/filter slices, four session slices, and two
-sink slices. Their exact worker assignment follows the registered-worker order, but every group
-is distributed round-robin:
+The LMS job now has two source paths and two outputs. Clean clicks fan out after bot filtering:
+one path is keyed by member id for sessions, while result clicks are tagged and unioned with
+tagged borrows before conversion matching. The union forces a multi-input task boundary and uses
+`REBALANCE`; the conversion operator is keyed by member and catalog item. Tasks are assigned by
+vertical slice across the registered workers:
 
 ```
                           +------------------ etcd ------------------+
@@ -69,18 +69,18 @@ is distributed round-robin:
    JobClient --SubmitJob--> master :7000 --DeployTask--> workers
                                   <--heartbeat (1s)----
 
-   worker-1            worker-2                worker-3
-   +-------------+     +-------------------+   +-------------------+
-   | chain slices|     | chain slices      |   | chain slices      |
-   | source/filter|    | sessions          |   | console           |
-   +-------------+     +-------------------+   +-------------------+
-          |                    ^                        ^
-          +--- gRPC records, credit-based ---------------+
+   Kafka clicks (4 partitions) -> drop-bots --+-- HASH(memberId) -> sessions -> session sink
+                                               |
+                                               +-> result-clicks -> tag-left --+
+                                                                                +-> union
+   Kafka borrows (4 partitions) -------------------------------> tag-right ----+  REBALANCE
+                                                                                   |
+                                                                                   +-> HASH(ConversionKey)
+                                                                                       -> interval join
+                                                                                       -> conversion sink
 
-   Kafka (4 partitions) feeds every clicks subtask.
-   clicks -> drop-bots is FORWARD and chained: one thread, a method call, no serialization.
-   drop-bots -> sessions is HASH by member id: key groups route one member to one subtask.
-   sessions -> console is REBALANCE: round-robin, across the network.
+   Worker tasks exchange records over gRPC with credit-based flow control. Each producer edge
+   retains its own exchange strategy; every union input subtask has a separate input-channel id.
 ```
 
 ---
@@ -214,19 +214,73 @@ checkpoint directory.
 
 ---
 
+## Phase 5 multi-input interval join
+
+The job API keeps two-input handling visible without making the runtime's task loop a special
+case for two physical inputs. `Either<L,R>` tags each element in one stream; `IntervalJoinOperator`
+is a keyed operator over that tagged stream:
+
+```text
+click source -> bot filter --+-- HASH(memberId) -> session branch
+                             +-- result click -> Either.left --+
+borrow source ---------------------------> Either.right ------+-- union(REBALANCE)
+                                                                -> HASH(ConversionKey)
+                                                                -> IntervalJoinOperator
+```
+
+`DataStream.union(id, other)` creates a timestamp-preserving pass-through transform with two
+upstream edges. `REBALANCE` gives each downstream subtask a channel for each upstream subtask;
+`FORWARD` cannot express fan-in when branches have different parallelisms or no one-to-one
+subtask correspondence. The compiler leaves the union at a multi-input task boundary, where
+watermark and barrier alignment can still identify each input independently.
+
+`FanOutOutput` handles the other side of the graph shape: when clean clicks feed both the session
+and conversion branches, it delegates each element and control marker to a separate
+edge-specific output. Each output keeps its own exchange and key selector. Input channels retain
+distinct upstream operator/subtask identity, rather than collapsing arrivals from both branches
+into one anonymous queue.
+
+The public API in `engine-api` consists of sealed `Either<L,R>`, `JoinFunction<L,R,O>`, and
+`IntervalJoinOperator<K,L,R,O>`. A pair matches when
+`lowerBound <= rightTimestamp - leftTimestamp <= upperBound`. The LMS config uses lower bound 0
+and upper bound 30 minutes, inclusive. Each new left or right record is checked against the
+opposite keyed `ListState`, then retained on its own side; the pair emits once when the second
+arrival is processed, regardless of which source arrived first.
+
+The join keeps `interval-join-left` and `interval-join-right` lists per `ConversionKey`, and exposes
+`left-buffer-size` and `right-buffer-size` gauges. Every retained record registers a timer. For
+this 0..30-minute forward interval, a left record at `t` is evicted only when
+`t + upperBound < watermark`; a right record at `t` is evicted only when
+`t < watermark - upperBound`. The strict predicates preserve the inclusive boundary matches
+while the watermark equals their last possible match time. A timer callback restores its key and
+evaluates the current watermark before removing expired entries.
+
+The deterministic borrow fixture is `demos/fixtures/borrows.jsonl` and is published by
+`demos/seed-borrows.sh`; clicks and borrows can be seeded in either order. If one branch lags,
+the combined watermark follows the slower active channel. The fast branch's unmatched records
+remain in its buffer until that watermark passes their cleanup horizon, making the slower-stream
+effect visible in the two gauges.
+
+The session branch remains keyed by `memberId`; the conversion branch is keyed by
+`ConversionKey(memberId, catalogItemId)`. The output remains console-based until Phase 6 adds the
+transactional Iceberg sink.
+
 ## Component table
 
 | Component | Lives in | Responsibility | Phase |
 |---|---|---|---|
-| `StreamElement` / `StreamRecord` / `Watermark` / `CheckpointBarrier` | engine-api | The record envelope. A watermark carries active/idle status as well as a timestamp; control elements travel in band with data | 1–3 |
+| `StreamElement` / `StreamRecord` / `Watermark` / `CheckpointBarrier` | engine-api | The record envelope. A watermark carries active/idle status as well as a timestamp; control elements travel in band with data | 1–4 |
 | `Operator` / `KeyedOperator` | engine-api | User logic. Single-threaded by contract; `Serializable` because it is shipped to a worker | 1 |
 | `JobGraph` + `DataStream` / `KeyedStream` | engine-api | The logical graph and the builder that produces it. Validated on construction, not in the builder | 1 |
+| `DataStream.union` | engine-api | Timestamp-preserving fan-in with `REBALANCE` edges and a multi-input boundary | 5 |
+| `Either` / `JoinFunction` | engine-api | Public left/right tag and pair-to-output function for a logical two-stream operator | 5 |
 | `KeyGroupAssigner` | engine-api | `key → key group → subtask`. The indirection that lets parallelism change without rehashing state | 1 |
 | `StateBackend` / `ValueState` / `ListState` | engine-api | Keyed state, narrow enough that heap and RocksDB are interchangeable | 1 (interfaces) |
 | `OperatorTask` | engine-runtime | Restores keyed context, advances watermarks/timers, aligns multi-input barriers, snapshots and forwards before ack | 1–4 |
 | `SourceTask` | engine-runtime | Polls a source, assigns event time, checkpoints connector position and emits watermarks/barriers | 1–4 |
-| `ResultPartitionWriter` | engine-runtime | Routes FORWARD/REBALANCE/BROADCAST/HASH records and broadcasts control elements only down channels it actually feeds | 1–3 |
-| `InputGate` | engine-runtime | One bounded queue per input channel. Reports which channel an element came from, and can block one without blocking the task | 2 |
+| `ResultPartitionWriter` | engine-runtime | Routes FORWARD/REBALANCE/BROADCAST/HASH records and broadcasts control elements only down channels it actually feeds | 1–5 |
+| `FanOutOutput` | engine-runtime | Dispatches records and control elements to separate edge-specific outputs | 5 |
+| `InputGate` | engine-runtime | One bounded queue per upstream operator/subtask channel; preserves identity for watermarks and barriers | 2–5 |
 | `OperatorChain` | engine-runtime | Fuses adjacent operators into one thread, exchanging records by method call | 2 |
 | `UserCodeClassLoader` | engine-runtime | Loads the job classes the engine was never compiled against | 2 |
 | `TaskInstances` | engine-runtime | Gives each subtask a private copy of its operator, by serialization | 1 |
@@ -254,7 +308,7 @@ checkpoint directory.
 | `RocksDbStateBackend` | engine-runtime | Keyed value/list state and RocksDB snapshots for task checkpoints | 4 |
 | `CheckpointStorage` | engine-worker | Archives/materializes full task checkpoints; filesystem and MinIO implementations | 4 |
 | `RestartStrategy` | engine-master | Fixed-delay job-wide restart attempts | 4 |
-| `IntervalJoinOperator` | engine-runtime | Two-sided buffering with watermark-driven eviction | 5 |
+| `IntervalJoinOperator` | engine-api | Keyed, timestamp-bounded matching with separate left/right `ListState` and cleanup gauges | 5 |
 | `IcebergSink` | engine-connectors | Two-phase commit against an Iceberg table | 6 |
 | `StatusApi` | engine-master | REST endpoints and Prometheus scrape | 7 |
 

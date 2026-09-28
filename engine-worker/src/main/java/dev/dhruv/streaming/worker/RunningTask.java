@@ -3,7 +3,7 @@ package dev.dhruv.streaming.worker;
 import dev.dhruv.streaming.runtime.OperatorTask;
 import dev.dhruv.streaming.runtime.SourceTask;
 import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
-import dev.dhruv.streaming.runtime.transport.ResultPartitionWriter;
+import dev.dhruv.streaming.runtime.transport.Output;
 
 import java.util.concurrent.ScheduledFuture;
 
@@ -26,7 +26,7 @@ record RunningTask(
         int subtaskIndex,
         Runnable task,
         Thread thread,
-        ResultPartitionWriter output,
+        Output output,
         ScheduledFuture<?> bufferFlush,
         TaskMetricGroup metrics
 ) {

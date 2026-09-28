@@ -1,0 +1,4 @@
+{"memberId":"m-1001","catalogItemId":"cat-7742","loanId":"loan-2001","eventTimeMillis":1757836890000}
+{"memberId":"m-1002","catalogItemId":"cat-3390","loanId":"loan-2002","eventTimeMillis":1757836910000}
+{"memberId":"m-1003","catalogItemId":"cat-5512","loanId":"loan-2003","eventTimeMillis":1757836950000}
+{"memberId":"m-1004","catalogItemId":"cat-6620","loanId":"loan-too-late","eventTimeMillis":1757838685001}

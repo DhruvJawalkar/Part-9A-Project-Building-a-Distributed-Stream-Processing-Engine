@@ -157,6 +157,42 @@ class LocalJobExecutorTest {
 
     @Test
     @Timeout(10)
+    @DisplayName("fans one upstream stream out to independently routed branches")
+    void fanOutDeliversEachRecordToEveryBranch() throws Exception {
+        JobGraph.Builder job = JobGraph.named("fan-out");
+        DataStream<String> input = job.source("in", new ListSource(List.of("a", "b", "c")));
+        input.<String>process("left", (record, out) -> out.collect("left-" + record.value()))
+                .sink("left-out", new CollectingSink("fan-out-left"));
+        input.<String>process("right", (record, out) -> out.collect("right-" + record.value()))
+                .sink("right-out", new CollectingSink("fan-out-right"));
+
+        runToCompletion(job.build());
+
+        assertThat(COLLECTED.get("fan-out-left"))
+                .containsExactlyInAnyOrder("left-a", "left-b", "left-c");
+        assertThat(COLLECTED.get("fan-out-right"))
+                .containsExactlyInAnyOrder("right-a", "right-b", "right-c");
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("two union inputs use distinct channels and finish together")
+    void multiInputSendersDoNotAliasInputChannelZero() throws Exception {
+        JobGraph.Builder job = JobGraph.named("multi-input-channels");
+        DataStream<String> left = job.source("left-in", new ListSource(List.of("left")));
+        DataStream<String> right = job.source("right-in", new ListSource(List.of("right")));
+        left.union("union", right).sink("out", new CollectingSink("multi-input-channels"));
+
+        // A bounded source propagates Watermark.MAX. Completion here proves that both union
+        // input channels received it; an aliased channel leaves the unused one open forever.
+        runToCompletion(job.build());
+
+        assertThat(COLLECTED.get("multi-input-channels")).containsExactlyInAnyOrder(
+                "left", "right");
+    }
+
+    @Test
+    @Timeout(10)
     @DisplayName("a silent source channel no longer stalls event-time progress after idleness")
     void idlenessUnblocksTheLocalExecutorWatermarkMinimum() throws Exception {
         assertThat(runWithOptionalIdleness(Duration.ZERO)).isFalse();
