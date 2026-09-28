@@ -17,6 +17,10 @@ dependencies {
 
 dependencies {
     testImplementation(libs.logback)
+    // The integration suite starts the real etcd it exercises. Keeping this dependency scoped
+    // here means normal unit tests neither need Docker nor pull a container image.
+    testImplementation(libs.testcontainers)
+    testImplementation(libs.testcontainers.junit)
 }
 
 // Integration tests need a live etcd. Kept out of `test` so that `./gradlew test` stays fast
@@ -34,7 +38,7 @@ configurations["integrationTestRuntimeOnly"]
     .extendsFrom(configurations.testRuntimeOnly.get())
 
 tasks.register<Test>("integrationTest") {
-    description = "Runs tests that need a live etcd."
+    description = "Runs etcd integration tests in a Testcontainers-managed container."
     group = "verification"
     testClassesDirs = sourceSets["integrationTest"].output.classesDirs
     classpath = sourceSets["integrationTest"].runtimeClasspath

@@ -2,10 +2,15 @@ package dev.dhruv.streaming.metadata;
 
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
 import java.util.List;
 import java.util.Map;
@@ -19,25 +24,50 @@ import static org.awaitility.Awaitility.await;
 /**
  * Integration tests for the etcd-backed metadata store.
  *
- * <p>Needs a live etcd: {@code docker compose up -d etcd}. Run with
- * {@code ./gradlew :engine-master:integrationTest}.
+ * <p>Starts an isolated etcd with Testcontainers; Docker must be running. Run with
+ * {@code ./gradlew :engine-metadata:integrationTest}. The suite deliberately does not use a
+ * developer's {@code localhost:2379}, so it cannot leave test data in a shared etcd or silently
+ * pass because another service happens to be running.
  *
  * <p>These exist for the behaviour the in-memory store deliberately does not imitate. Two things
  * in particular can only be checked against the real thing, and both are load-bearing for
  * Phase 2's failure handling: a lease that expires without anyone deleting anything, and a
  * watch that fires when it does.
  */
+@Testcontainers
 class EtcdMetadataStoreIT {
 
-    private static final String ENDPOINT = System.getenv().getOrDefault(
-            "ETCD_ENDPOINTS", "http://localhost:2379");
+    private static final DockerImageName ETCD_IMAGE =
+            DockerImageName.parse("quay.io/coreos/etcd:v3.5.17");
+
+    @Container
+    private static final GenericContainer<?> ETCD = new GenericContainer<>(ETCD_IMAGE)
+            .withExposedPorts(2379)
+            .withCommand(
+                    "etcd",
+                    "--listen-client-urls=http://0.0.0.0:2379",
+                    "--advertise-client-urls=http://0.0.0.0:2379");
+
+    private static String endpoint;
 
     private EtcdMetadataStore store;
     private String jobId;
 
+    @BeforeAll
+    static void startEtcd() {
+        // @Container has started it by this point. Keeping endpoint construction here makes a
+        // Docker/Testcontainers startup problem fail before any store operation can time out.
+        if (!ETCD.isRunning()) {
+            throw new IllegalStateException(
+                    "Testcontainers did not start etcd. Ensure Docker is running and can pull "
+                            + ETCD_IMAGE);
+        }
+        endpoint = "http://" + ETCD.getHost() + ":" + ETCD.getMappedPort(2379);
+    }
+
     @BeforeEach
     void setUp() {
-        store = new EtcdMetadataStore(ENDPOINT);
+        store = new EtcdMetadataStore(endpoint);
         // A unique job id per test, so a run leaves nothing behind that another run trips over.
         jobId = "it-job-" + UUID.randomUUID();
     }
@@ -81,7 +111,7 @@ class EtcdMetadataStoreIT {
         store.putAssignments(jobId, Map.of("clicks:0", "worker-1"));
         store.close();
 
-        store = new EtcdMetadataStore(ENDPOINT);
+        store = new EtcdMetadataStore(endpoint);
 
         assertThat(store.getJobState(jobId)).contains(JobState.RUNNING);
         assertThat(store.getAssignments(jobId)).containsEntry("clicks:0", "worker-1");
@@ -112,7 +142,7 @@ class EtcdMetadataStoreIT {
                     .contains(worker.workerId());
 
             // Another client, as the master would be if the worker registered itself.
-            try (EtcdMetadataStore reader = new EtcdMetadataStore(ENDPOINT)) {
+            try (EtcdMetadataStore reader = new EtcdMetadataStore(endpoint)) {
                 assertThat(reader.listWorkers())
                         .extracting(RegisteredWorker::workerId)
                         .contains(worker.workerId());

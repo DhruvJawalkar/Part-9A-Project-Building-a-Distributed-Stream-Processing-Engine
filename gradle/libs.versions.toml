@@ -13,7 +13,9 @@ grpc     = "1.84.0"
 protobuf = "4.36.1"
 jetcd    = "0.8.7"
 protobufPlugin = "0.10.0"
-testcontainers = "1.20.4"
+# 1.21.4 raises docker-java's default API level so Testcontainers works with modern Docker
+# engines that no longer accept the 1.32 API used by 1.20.x.
+testcontainers = "1.21.4"
 awaitility = "4.3.0"
 
 [libraries]
