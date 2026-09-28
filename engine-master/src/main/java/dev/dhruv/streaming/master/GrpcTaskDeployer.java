@@ -56,6 +56,11 @@ import java.util.concurrent.TimeUnit;
  */
 public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
 
+    // A worker gives external sink callbacks up to 90 seconds. The control-plane deadline must
+    // be strictly larger so network delivery and response serialization cannot cancel a commit
+    // at the worker's own boundary.
+    private static final long CHECKPOINT_COMPLETION_RPC_TIMEOUT_SECONDS = 120;
+
     private static final Logger log = LoggerFactory.getLogger(GrpcTaskDeployer.class);
 
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
@@ -360,7 +365,8 @@ public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
                 .setCheckpointId(checkpointId)
                 .setJobId(graph.jobId())
                 .build();
-        sinkWorkers.forEach(worker -> stubFor(worker).withDeadlineAfter(30, TimeUnit.SECONDS)
+        sinkWorkers.forEach(worker -> stubFor(worker)
+                .withDeadlineAfter(CHECKPOINT_COMPLETION_RPC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 .notifyCheckpointComplete(completion));
     }
 

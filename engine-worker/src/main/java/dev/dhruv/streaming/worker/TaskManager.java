@@ -64,6 +64,9 @@ import java.util.concurrent.TimeUnit;
  */
 public final class TaskManager implements AutoCloseable {
 
+    /** Upper bound for a checkpoint-transactional sink's external commit on this worker. */
+    private static final long SINK_COMMIT_TIMEOUT_SECONDS = 90;
+
     private static final Logger log = LoggerFactory.getLogger(TaskManager.class);
 
     /**
@@ -201,7 +204,7 @@ public final class TaskManager implements AutoCloseable {
         boolean checkpointCompletionParticipant = deployment.getOperators(
                 deployment.getOperatorsCount() - 1).getKind() == OperatorKind.OPERATOR_SINK;
         tasks.put(taskKey, new RunningTask(taskKey, deployment.getJobId(), headOperatorId, subtask,
-                checkpointCompletionParticipant, task, thread, output, flushTask, metrics));
+                checkpointCompletionParticipant, task, thread, output, flushTask, metrics, gate));
 
         thread.start();
         return taskKey;
@@ -471,17 +474,20 @@ public final class TaskManager implements AutoCloseable {
 
     /** Delivers a durable-checkpoint callback to the sink chains hosted by this worker. */
     public void notifyCheckpointComplete(String jobId, long checkpointId) throws Exception {
-        List<java.util.concurrent.CompletableFuture<Void>> notifications = new ArrayList<>();
-        for (RunningTask task : List.copyOf(tasks.values())) {
-            if (task.jobId().equals(jobId) && task.checkpointCompletionParticipant()) {
-                notifications.add(task.notifyCheckpointComplete(checkpointId));
-            }
-        }
-        for (java.util.concurrent.CompletableFuture<Void> notification : notifications) {
+        List<RunningTask> participants = tasks.values().stream()
+                .filter(task -> task.jobId().equals(jobId))
+                .filter(RunningTask::checkpointCompletionParticipant)
+                .sorted(java.util.Comparator.comparing(RunningTask::taskKey))
+                .toList();
+        for (RunningTask task : participants) {
+            // Complete one external transaction at a time. Besides making retries reproducible,
+            // this avoids concurrent catalog commits from sink chains sharing a worker. The
+            // checkpoint is not reported complete until every participant has committed.
             // A catalog commit may include object-store metadata writes and is allowed the same
             // bounded window as the master's completion RPC. The RPC must not report success
             // before these futures do.
-            notification.get(30, TimeUnit.SECONDS);
+            task.notifyCheckpointComplete(checkpointId)
+                    .get(SINK_COMMIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
     }
 

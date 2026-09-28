@@ -150,7 +150,215 @@ services:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
 
+  # Create the LMS namespace and tables before submitting the fixture job. These REST calls are
+  # idempotent: 409 means the object already exists and is therefore success for this bootstrap.
+  iceberg-init:
+    image: curlimages/curl:8.12.1
+    container_name: lms-iceberg-init
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    volumes:
+      - ./demos/iceberg:/schema:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        until curl -fsS http://iceberg-rest:8181/v1/config >/dev/null; do sleep 1; done
+        post() {
+          code="$$(curl -sS -o /tmp/response -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' --data-binary "@$$2" "$$1")"
+          case "$$code" in 2??|409) ;; *) cat /tmp/response; exit 1 ;; esac
+        }
+        post http://iceberg-rest:8181/v1/namespaces /schema/namespace.json
+        post http://iceberg-rest:8181/v1/namespaces/lms%1Fanalytics/tables /schema/browse_sessions.table.json
+        post http://iceberg-rest:8181/v1/namespaces/lms%1Fanalytics/tables /schema/click_conversions.table.json
+        echo "Iceberg schema ready"
+
+  master:
+    build:
+      context: .
+      target: runtime
+    image: lms-stream-engine:phase7
+    container_name: lms-master
+    command: ["/opt/engine/engine-entrypoint.sh", "master"]
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "${MASTER_STATUS_HOST_PORT:-18080}:8080"
+    environment:
+      MASTER_PORT: 9090
+      MASTER_STATUS_PORT: 8080
+      ETCD_ENDPOINTS: http://etcd:2379
+      CHECKPOINT_INTERVAL_MS: 10000
+      CHECKPOINT_TIMEOUT_MS: 30000
+      RESTART_MAX_ATTEMPTS: 3
+      RESTART_DELAY_MS: 1000
+    restart: unless-stopped
+
+  worker1:
+    image: lms-stream-engine:phase7
+    container_name: lms-worker-1
+    command: ["/opt/engine/engine-entrypoint.sh", "worker"]
+    depends_on:
+      master:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "${WORKER1_METRICS_HOST_PORT:-18081}:8081"
+    environment: &worker-environment
+      WORKER_ID: worker-1
+      WORKER_HOST: worker1
+      WORKER_RPC_PORT: 9091
+      WORKER_DATA_PORT: 9191
+      WORKER_METRICS_PORT: 8081
+      WORKER_SLOTS: 12
+      MASTER_HOST: master
+      MASTER_PORT: 9090
+      ETCD_ENDPOINTS: http://etcd:2379
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: stream-checkpoints
+    restart: unless-stopped
+
+  worker2:
+    image: lms-stream-engine:phase7
+    container_name: lms-worker-2
+    command: ["/opt/engine/engine-entrypoint.sh", "worker"]
+    depends_on:
+      master:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "${WORKER2_METRICS_HOST_PORT:-18082}:8081"
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker-2
+      WORKER_HOST: worker2
+    restart: unless-stopped
+
+  worker3:
+    image: lms-stream-engine:phase7
+    container_name: lms-worker-3
+    command: ["/opt/engine/engine-entrypoint.sh", "worker"]
+    depends_on:
+      master:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "${WORKER3_METRICS_HOST_PORT:-18083}:8081"
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker-3
+      WORKER_HOST: worker3
+    restart: unless-stopped
+
+  # The submitter waits for all three workers through the master's existing submission contract.
+  # It then exits successfully; seed-fixtures publishes only after that happens.
+  seed-job:
+    image: lms-stream-engine:phase7
+    container_name: lms-seed-job
+    depends_on:
+      worker1:
+        condition: service_started
+      worker2:
+        condition: service_started
+      worker3:
+        condition: service_started
+      iceberg-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        attempt=0
+        until java -cp '/opt/engine/submit/classes:/opt/engine/master/lib/*:/opt/engine/lms/lib/*' \
+          dev.dhruv.streaming.lms.SubmitLmsJob; do
+          attempt=$$((attempt + 1))
+          if [ "$$attempt" -ge 30 ]; then exit 1; fi
+          echo "master not ready; retrying job submission ($$attempt/30)"
+          sleep 2
+        done
+    environment:
+      MASTER_HOST: master
+      MASTER_PORT: 9090
+      MIN_WORKERS: 3
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      ICEBERG_CATALOG_URI: http://iceberg-rest:8181
+      ICEBERG_WAREHOUSE: s3://warehouse/
+      ICEBERG_S3_ENDPOINT: http://minio:9000
+      ICEBERG_S3_ACCESS_KEY: minioadmin
+      ICEBERG_S3_SECRET_KEY: minioadmin
+      ICEBERG_S3_REGION: us-east-1
+    restart: "no"
+
+  seed-fixtures:
+    image: apache/kafka:3.9.0
+    container_name: lms-seed-fixtures
+    depends_on:
+      seed-job:
+        condition: service_completed_successfully
+    volumes:
+      - ./demos/fixtures:/fixtures:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
+          --topic lms.catalog.clicks < /fixtures/clicks.jsonl
+        /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
+          --topic lms.catalog.borrows < /fixtures/borrows.jsonl
+        echo "deterministic click and borrow fixtures published"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: lms-prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      master:
+        condition: service_started
+      worker1:
+        condition: service_started
+      worker2:
+        condition: service_started
+      worker3:
+        condition: service_started
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: lms-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "${GRAFANA_HOST_PORT:-13000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+
 volumes:
   kafka-data:
   etcd-data:
   minio-data:
+  prometheus-data:
+  grafana-data:

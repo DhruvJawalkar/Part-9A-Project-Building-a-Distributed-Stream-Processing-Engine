@@ -70,17 +70,34 @@ tasks.register<JavaExec>("submitToCluster") {
     classpath = sourceSets["submit"].runtimeClasspath
 }
 
+// Windows limits a process command line to roughly 32 KiB. This process-level test has a broad
+// runtime (master, workers, Iceberg, Testcontainers); expanding that graph once for Gradle's test
+// JVM and again in processTestClasspath crossed the limit when Phase 7 added metrics. A manifest
+// classpath keeps both launches to one short JAR path while preserving the resolved dependency set.
+val integrationTestPathingJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("integration-test-pathing")
+    dependsOn(tasks.named("integrationTestClasses"))
+    doFirst {
+        manifest.attributes["Class-Path"] = sourceSets["integrationTest"].runtimeClasspath.files
+            .joinToString(" ") { it.toURI().toASCIIString() }
+    }
+}
+
 tasks.register<Test>("integrationTest") {
     description = "Runs the process-level checkpoint and worker-recovery acceptance test."
     group = "verification"
+    dependsOn(integrationTestPathingJar)
     testClassesDirs = sourceSets["integrationTest"].output.classesDirs
-    classpath = sourceSets["integrationTest"].runtimeClasspath
+    classpath = files(integrationTestPathingJar.flatMap { it.archiveFile })
     useJUnitPlatform()
     shouldRunAfter(tasks.test)
 
     // A Gradle test worker's java.class.path is only its bootstrap jar. Give the test the real
-    // resolved classpath explicitly so child JVMs can launch portably on Windows and Unix.
-    systemProperty("processTestClasspath", sourceSets["integrationTest"].runtimeClasspath.asPath)
+    // pathing JAR explicitly so its child JVMs use the same portable, short classpath.
+    doFirst {
+        systemProperty("processTestClasspath",
+            integrationTestPathingJar.get().archiveFile.get().asFile.absolutePath)
+    }
 }
 
 tasks.named("check") {

@@ -14,6 +14,8 @@ The design rationale, interfaces and algorithm sketches live in
 [`docs/Part9A_Project_Companion.pdf`](docs/Part9A_Project_Companion.pdf).
 [`CLAUDE.md`](CLAUDE.md) is the authoritative build instruction.
 [`docs/DESIGN.md`](docs/DESIGN.md) is the living implementation design.
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) follows a record from the job DAG through
+scheduling, event time, checkpointing, state, transactional output, and recovery.
 [`docs/BUG-LOG.md`](docs/BUG-LOG.md) records every bug found while building this, and why most of
 them produced no error at all.
 
@@ -37,8 +39,8 @@ implementation stops is part of understanding what production engines do for you
 | **3** | Event time, watermarks, keyed state, session windows | **Complete** |
 | **4** | Checkpointing, barrier alignment, portable state, recovery | **Complete** |
 | **5** | Two-stream event-time interval join and conversion branch | **Complete** |
-| 6 | Transactional Iceberg sink, REST catalog and MinIO demo surface | **Complete** |
-| 7 | Status API and the four demos | Planned |
+| **6** | Transactional Iceberg sink, REST catalog and MinIO demo surface | **Complete** |
+| **7** | REST/Prometheus status, Grafana, Compose stack and four reproducible demos | **Complete** |
 
 ---
 
@@ -47,11 +49,27 @@ implementation stops is part of understanding what production engines do for you
 Requires **JDK 21+** and **Docker**.
 
 ```bash
-docker compose up -d          # Kafka, etcd, MinIO and the Iceberg REST catalog
-./demos/iceberg/init-schema.sh # create lms.analytics and both output tables
-./demos/run-cluster.sh         # also runs the idempotent schema init; master :7000, workers :7001-7003
-./demos/seed-clicks.sh         # publish clicks
-./demos/seed-borrows.sh        # publish borrows; either fixture can be seeded first
+docker compose up -d --build
+```
+
+That command starts Kafka, etcd, MinIO, the Iceberg REST catalog, one master, three workers,
+Prometheus, and Grafana. One-shot bootstrap services create both Iceberg tables, submit the LMS
+job after all three workers register, and publish the deterministic click and borrow fixtures.
+The status API is at <http://localhost:18080/jobs>, Prometheus at <http://localhost:9090>, and
+Grafana at <http://localhost:13000> (`admin` / `admin`). The deliberately offset host ports avoid
+collisions with common local web-development ports; `MASTER_STATUS_HOST_PORT`,
+`WORKER1_METRICS_HOST_PORT` through `WORKER3_METRICS_HOST_PORT`, and `GRAFANA_HOST_PORT` can
+override them. The provisioned dashboard has exactly the
+four signals used in the article: source lag, checkpoint duration/alignment, records-in by
+subtask, and state size by subtask.
+
+The host-launched workflow remains useful while changing Java code:
+
+```bash
+docker compose up -d kafka etcd minio minio-init iceberg-rest
+./demos/run-cluster.sh
+./demos/seed-clicks.sh
+./demos/seed-borrows.sh
 ./gradlew :lms-job:submitToCluster
 ```
 
@@ -77,8 +95,8 @@ and the LMS fixture replay with `./gradlew :lms-job:test`.
 
 Keep the cluster running while you inspect the session and conversion rows in the two Iceberg
 tables. `demos/logs/` contains master/worker operational logs rather than result rows.
-When finished, stop the workers with `./demos/run-cluster.sh stop`, then stop dependencies with
-`docker compose down -v`.
+When finished, use `docker compose down` to retain the demo volumes, or `docker compose down -v`
+for a clean replay. For the host workflow, stop workers first with `./demos/run-cluster.sh stop`.
 
 ### A note on output ordering
 
@@ -420,6 +438,78 @@ demo infrastructure. The opt-in `IcebergRestMinioSmokeTest` verifies the real RE
 
 ---
 
+## What Phase 7 built
+
+Phase 7 makes the earlier correctness claims observable and reproducible. The master exposes a
+small framework-free HTTP API on port 8080:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/jobs` | List job id, name, state, and start time |
+| `GET` | `/jobs/{jobId}` | State, logical vertices, and restart count |
+| `GET` | `/jobs/{jobId}/tasks` | Worker placement, records, watermark, queue occupancy, and backpressure per subtask |
+| `GET` | `/jobs/{jobId}/checkpoints` | Interval, completed/failed counts, and checkpoint history |
+| `GET` | `/jobs/{jobId}/lag` | Kafka lag by owned partition and maximum lag time |
+| `POST` | `/jobs/{jobId}/cancel` | Persist and execute an explicit cancellation |
+| `GET` | `/metrics` | Prometheus exposition for the master |
+
+Each worker also serves `/metrics` on its metrics port. Task series retain `job`, `operator`,
+`subtask`, and `worker` labels so skew cannot disappear into a cluster-wide aggregate. Queue
+occupancy and `stream_engine_backpressured` reflect the real bounded `InputGate`; checkpoint
+duration, alignment, and state bytes come from the latest task acknowledgement. Kafka source lag
+is calculated from each source's owned partition positions and broker end offsets.
+
+Three nullable/status-lifetime boundaries are intentional. `startedAt` is the current master's
+admission timestamp and is `null` after master recovery because submission time is not persisted.
+Task `watermark` is currently `null` because heartbeats do not yet carry per-task event-time
+progress. Checkpoint counters/history are current-master operational history; etcd retains the
+latest completed recovery point, not an observability journal. `maxLagMillis` is `null` because
+Kafka offsets alone cannot reveal the timestamp of an unread record without fetching it.
+
+The default `docker-compose.yml` is the executable deployment diagram. It builds one Java 21
+runtime image and runs the same artifacts as the host launcher. The LMS user-code libraries are
+present in the image because this teaching engine names a job classpath at process startup rather
+than uploading a job JAR. Schema initialization, job submission, and fixture publication are
+one-shot services; Prometheus and Grafana are provisioned from files under `observability/`.
+
+### Four reproducible demonstrations
+
+Every script prints the signal to watch, the claim it proves, and the matching article section
+before it runs. The scripts use checked-in fixtures (or, for process recovery, a deterministic
+fixture embedded in the acceptance harness) and fail when the claimed outcome is absent.
+
+| Demo | Run | What to watch | What it proves |
+|---|---|---|---|
+| Worker dies mid-window | `./demos/demo-1-worker-loss.sh` | Session owner is force-killed; all tasks rewind; recovered bytes equal a clean run | A checkpoint is one distributed cut across offsets, state, timers, and output (§§10.1–10.3) |
+| Master dies | `./demos/demo-2-master-loss.sh` | A fresh master fences the old execution and restores every task from etcd/MinIO | Durable metadata, not master RAM, owns recovery (§§7, 10.3) |
+| Late event | `./demos/demo-3-late-event.sh` | Default policy drops/counts; configured lateness accepts and revises the open session | Watermarks turn completeness into an explicit policy (§§6.2–6.4) |
+| Hot key | `./demos/demo-4-hot-key.sh` | One unsalted owner exceeds capacity while siblings idle; salted local work is flat and output is unchanged | Per-subtask metrics reveal skew; two-stage aggregation fixes it (§§5.3, 9) |
+
+The salting flag is `-Dlms.sessions.salted=true`. It changes only the session branch:
+
+```text
+click -> deterministic salt -> HASH(member,salt) -> local session fragments
+      -> HASH(member) -> global fragment merge -> the same SessionRow
+```
+
+The local stage uses 16 stable salts. The global stage waits one additional session gap before
+publishing, which gives every local salt time to close; the business `sessionEnd` remains the
+ordinary last-event-plus-gap value. Because `ClickEvent` has no immutable event id, byte-identical
+duplicate payloads deliberately choose the same salt. This preserves replay determinism while
+normal time-varying traffic is spread across the local stage.
+
+### Late-data boundary
+
+`SessionAggregator()` uses zero allowed lateness: an event behind the current watermark is counted
+in `late-session-events` and dropped. `SessionAggregator(Duration)` may accept a behind-watermark
+event while the current session is still retained and increments `accepted-late-session-events`.
+The teaching engine does not retain and rewrite already-emitted historical sessions, and the
+Iceberg sink is append-only rather than an upsert sink. The demo therefore proves open-window
+revision versus drop; reopening closed output would require equality deletes or a keyed upsert
+table and is intentionally not claimed.
+
+---
+
 ## Known limitations
 
 Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
@@ -440,8 +530,8 @@ console sink. Phase 6 provides exactly-once visible rows for completed checkpoin
 unpartitioned Iceberg sink, while orphaned objects still require normal object-store maintenance.
 The production LMS inputs are unbounded Kafka sources; bounded sources currently need an explicit
 checkpoint before exhaustion or their final post-checkpoint interval remains an orphan.
-`FileReplaySource` is bounded and deterministic, but the Phase 7 runnable demos have not been added. Job classes reach master and
-workers through a `JOB_CLASSPATH` set at startup rather than being shipped with submission, so
+`FileReplaySource` is bounded and deterministic. Job classes reach master and workers through a
+startup classpath (or the shared Compose image) rather than being shipped with submission, so
 every process needs the same classpath and changing the job means restarting them.
 
 ---

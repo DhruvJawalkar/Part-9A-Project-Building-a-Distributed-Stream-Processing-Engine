@@ -53,9 +53,27 @@ class SessionPipelineAcceptanceTest {
                 "member-alpha|2000000|2000000|2900000|0|1|new session");
     }
 
+    @Test
+    @Timeout(10)
+    void saltedTwoPhaseSessionsProduceTheSameClosedRowsAsTheSingleKeyPath() throws Exception {
+        assertThat(SaltedSessionAggregator.saltFor(new ClickEvent("member-alpha", "book-1",
+                "earlier", ClickEvent.SEARCH, 18_000L))).isNotEqualTo(
+                SaltedSessionAggregator.saltFor(new ClickEvent("member-alpha", "book-1",
+                        "later", ClickEvent.RESULT_CLICK, 20_000L)));
+        List<byte[]> unsalted = runFixture(false);
+        List<byte[]> salted = runFixture(true);
+
+        assertThat(salted).hasSameSizeAs(unsalted);
+        assertThat(rows(salted)).containsExactlyInAnyOrderElementsOf(rows(unsalted));
+    }
+
     private static List<byte[]> runFixture() throws Exception {
+        return runFixture(false);
+    }
+
+    private static List<byte[]> runFixture(boolean salted) throws Exception {
         CAPTURED_ROWS.clear();
-        try (JobExecutor executor = JobExecutors.local(sessionJob(fixturePath()))) {
+        try (JobExecutor executor = JobExecutors.local(sessionJob(fixturePath(), salted))) {
             executor.start();
             executor.awaitTermination();
         }
@@ -63,13 +81,29 @@ class SessionPipelineAcceptanceTest {
     }
 
     private static JobGraph sessionJob(Path fixture) {
+        return sessionJob(fixture, false);
+    }
+
+    private static JobGraph sessionJob(Path fixture, boolean salted) {
         JobGraph.Builder job = JobGraph.named("out-of-order-session-acceptance");
         DataStream<ClickEvent> clicks = job.source("clicks", FileReplaySource.of(fixture, ClickEvent.class))
                 .withEventTime(ClickEvent::eventTimeMillis, OUT_OF_ORDERNESS)
                 .parallelism(1);
 
-        clicks.keyBy("by-member", ClickEvent::memberId)
-                .process("sessions", new SessionAggregator())
+        DataStream<SessionRow> sessions;
+        if (salted) {
+            DataStream<SaltedSessionAggregator.SaltedClickEvent> saltedClicks = clicks
+                    .process("salt-session-events", new SaltedSessionAggregator.Salter());
+            DataStream<SaltedSessionAggregator.SessionSegment> local = saltedClicks
+                    .keyBy("by-member-and-salt", SaltedSessionAggregator.SaltedClickEvent::key)
+                    .process("local-sessions", new SaltedSessionAggregator.LocalSessionAggregator());
+            sessions = local.keyBy("by-member", SaltedSessionAggregator.SessionSegment::memberId)
+                    .process("sessions", new SaltedSessionAggregator.GlobalSessionAggregator());
+        } else {
+            sessions = clicks.keyBy("by-member", ClickEvent::memberId)
+                    .process("sessions", new SessionAggregator());
+        }
+        sessions
                 .sink("capture", new CanonicalCapturingSink())
                 .parallelism(1);
         return job.build();

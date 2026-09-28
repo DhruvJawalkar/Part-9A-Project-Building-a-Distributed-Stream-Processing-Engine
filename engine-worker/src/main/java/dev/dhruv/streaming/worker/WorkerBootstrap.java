@@ -4,6 +4,7 @@ import dev.dhruv.streaming.metadata.RegisteredWorker;
 import dev.dhruv.streaming.metadata.EtcdMetadataStore;
 import dev.dhruv.streaming.metadata.MetadataStore;
 import dev.dhruv.streaming.rpc.MasterServiceGrpc;
+import dev.dhruv.streaming.rpc.Empty;
 import dev.dhruv.streaming.rpc.TaskFailure;
 import dev.dhruv.streaming.rpc.TaskId;
 import dev.dhruv.streaming.rpc.WorkerInfo;
@@ -63,9 +64,11 @@ public final class WorkerBootstrap implements AutoCloseable {
 
     private Server controlServer;
     private Server dataServer;
+    private WorkerMetricsServer metricsServer;
     private MetadataStore.WorkerRegistration registration;
     private HeartbeatClient heartbeat;
     private MasterServiceGrpc.MasterServiceBlockingStub masterBlocking;
+    private MasterServiceGrpc.MasterServiceStub masterAsync;
 
     /**
      * Creates a worker.
@@ -110,6 +113,9 @@ public final class WorkerBootstrap implements AutoCloseable {
      * @throws IOException if either port cannot be bound
      */
     public void start(String masterHost, int masterPort) throws IOException {
+        int metricsPort = Integer.parseInt(env("WORKER_METRICS_PORT", "8081"));
+        metricsServer = new WorkerMetricsServer(metricsPort, workerId, taskManager);
+        metricsServer.start();
         controlServer = NettyServerBuilder.forPort(rpcPort)
                 .addService(new WorkerService(taskManager))
                 .build()
@@ -126,13 +132,13 @@ public final class WorkerBootstrap implements AutoCloseable {
                 .build()
                 .start();
 
-        log.info("worker {} listening: control {}:{}, data {}:{}",
-                workerId, host, rpcPort, host, dataPort);
+        log.info("worker {} listening: control {}:{}, data {}:{}, metrics :{}",
+                workerId, host, rpcPort, host, dataPort, metricsServer.port());
 
         var masterChannel = NettyChannelBuilder.forAddress(masterHost, masterPort)
                 .usePlaintext()
                 .build();
-        var masterAsync = MasterServiceGrpc.newStub(masterChannel);
+        this.masterAsync = MasterServiceGrpc.newStub(masterChannel);
         this.masterBlocking = MasterServiceGrpc.newBlockingStub(masterChannel);
 
         masterBlocking.registerWorker(WorkerInfo.newBuilder()
@@ -143,16 +149,19 @@ public final class WorkerBootstrap implements AutoCloseable {
                 .setSlots(slots)
                 .build());
 
-        // etcd after the master, so that a worker only appears schedulable once it is actually
-        // able to accept a deployment.
-        registration = metadata.registerWorker(
-                new RegisteredWorker(workerId, host, rpcPort, dataPort, slots), LEASE_TTL_SECONDS);
-
         taskManager.onTaskFailure(this::reportTaskFailure);
         taskManager.onCheckpointAcknowledgement(this::acknowledgeCheckpoint);
 
+        // Start beating immediately after the master begins its liveness clock. Registering the
+        // etcd lease can involve a network round trip and must not consume the failure detector's
+        // entire grace window during a busy cluster startup.
         heartbeat = new HeartbeatClient(workerId, masterAsync, taskManager);
         heartbeat.start();
+
+        // etcd after the master, so that a worker only appears schedulable once it is actually
+        // able to accept a deployment. Heartbeats run independently while the lease is acquired.
+        registration = metadata.registerWorker(
+                new RegisteredWorker(workerId, host, rpcPort, dataPort, slots), LEASE_TTL_SECONDS);
 
         log.info("worker {} registered with the master at {}:{} and with etcd",
                 workerId, masterHost, masterPort);
@@ -193,16 +202,27 @@ public final class WorkerBootstrap implements AutoCloseable {
     }
 
     private void acknowledgeCheckpoint(dev.dhruv.streaming.rpc.CheckpointAck acknowledgement) {
-        try {
-            masterBlocking.acknowledgeCheckpoint(acknowledgement);
-        } catch (Exception e) {
-            // The coordinator persists only a fully acknowledged checkpoint. If the master is
-            // temporarily unavailable this acknowledgement is lost and that checkpoint times
-            // out; a later checkpoint will produce a fresh, complete cut.
-            log.warn("could not acknowledge checkpoint {} for {}#{}",
-                    acknowledgement.getCheckpointId(), acknowledgement.getTaskId().getOperatorId(),
-                    acknowledgement.getTaskId().getSubtaskIndex(), e);
-        }
+        // Never block a task thread on the coordinator's response. The final acknowledgement can
+        // synchronously cause the master to deliver notifyCheckpointComplete back to this very
+        // task; a blocking stub here would make each side wait for the other. If delivery fails,
+        // the coordinator simply times out this checkpoint and a later one produces a fresh cut.
+        masterAsync.acknowledgeCheckpoint(acknowledgement, new StreamObserver<>() {
+            @Override
+            public void onNext(Empty ignored) {
+            }
+
+            @Override
+            public void onError(Throwable failure) {
+                log.warn("could not acknowledge checkpoint {} for {}#{}",
+                        acknowledgement.getCheckpointId(),
+                        acknowledgement.getTaskId().getOperatorId(),
+                        acknowledgement.getTaskId().getSubtaskIndex(), failure);
+            }
+
+            @Override
+            public void onCompleted() {
+            }
+        });
     }
 
     /**
@@ -226,6 +246,9 @@ public final class WorkerBootstrap implements AutoCloseable {
             registration.close();
         }
         taskManager.close();
+        if (metricsServer != null) {
+            metricsServer.close();
+        }
         transportClient.close();
         shutdown(dataServer);
         shutdown(controlServer);

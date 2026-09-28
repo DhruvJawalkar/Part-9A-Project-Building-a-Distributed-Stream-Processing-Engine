@@ -12,6 +12,8 @@ dependencies {
     implementation(project(":engine-runtime"))
 
     implementation(libs.slf4j.api)
+    implementation(libs.micrometer.core)
+    implementation(libs.micrometer.prometheus)
 
     testImplementation(libs.logback)
     runtimeOnly(libs.logback)

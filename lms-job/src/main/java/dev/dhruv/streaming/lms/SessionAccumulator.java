@@ -35,6 +35,17 @@ final class SessionAccumulator implements Serializable {
         return accumulator;
     }
 
+    /** Rehydrates an already-closed local fragment for the global aggregation phase. */
+    static SessionAccumulator from(SaltedSessionAggregator.SessionSegment segment) {
+        Objects.requireNonNull(segment, "segment");
+        SessionAccumulator accumulator = new SessionAccumulator(segment.memberId(),
+                segment.sessionStartMillis());
+        accumulator.lastEventTimeMillis = segment.lastEventTimeMillis();
+        accumulator.clickCount = segment.clickCount();
+        accumulator.searchTerms.addAll(segment.searchTerms());
+        return accumulator;
+    }
+
     void add(ClickEvent event, long eventTimeMillis) {
         Objects.requireNonNull(event, "event");
         if (!memberId.equals(event.memberId())) {
@@ -48,6 +59,18 @@ final class SessionAccumulator implements Serializable {
         }
     }
 
+    /** Combines a closed local fragment without retaining its individual input events. */
+    void merge(SaltedSessionAggregator.SessionSegment segment) {
+        Objects.requireNonNull(segment, "segment");
+        if (!memberId.equals(segment.memberId())) {
+            throw new IllegalArgumentException("a session may only contain one member's events");
+        }
+        sessionStartMillis = Math.min(sessionStartMillis, segment.sessionStartMillis());
+        lastEventTimeMillis = Math.max(lastEventTimeMillis, segment.lastEventTimeMillis());
+        clickCount = Math.addExact(clickCount, segment.clickCount());
+        searchTerms.addAll(segment.searchTerms());
+    }
+
     SessionRow toRow(long sessionEndMillis) {
         return new SessionRow(memberId, sessionStartMillis, lastEventTimeMillis, sessionEndMillis,
                 lastEventTimeMillis - sessionStartMillis, clickCount, List.copyOf(searchTerms));
@@ -56,5 +79,9 @@ final class SessionAccumulator implements Serializable {
     /** Event time of the first member action retained by this open session. */
     long sessionStartMillis() {
         return sessionStartMillis;
+    }
+
+    long lastEventTimeMillis() {
+        return lastEventTimeMillis;
     }
 }

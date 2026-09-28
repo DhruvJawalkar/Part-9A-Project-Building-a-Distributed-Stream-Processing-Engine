@@ -11,11 +11,16 @@ import dev.dhruv.streaming.api.state.ValueState;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.io.Reader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.function.LongSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -131,6 +136,62 @@ class SessionAggregatorTest {
         assertThat(context.entryCount()).isZero();
     }
 
+    @Test
+    void dropsAnEventBehindTheWatermarkByDefaultButAcceptsItWithinConfiguredLateness()
+            throws Exception {
+        Properties fixture = fixture("late-event.properties");
+        String member = fixture.getProperty("member");
+        long current = Long.parseLong(fixture.getProperty("current.event.time"));
+        long late = Long.parseLong(fixture.getProperty("late.event.time"));
+        long watermark = Long.parseLong(fixture.getProperty("watermark"));
+        Duration allowedLateness = Duration.ofMillis(Long.parseLong(
+                fixture.getProperty("allowed.lateness")));
+
+        TestOperatorContext droppingContext = new TestOperatorContext();
+        droppingContext.setCurrentKey(member);
+        SessionAggregator dropping = open(droppingContext);
+        RecordingCollector droppedOutput = new RecordingCollector();
+        dropping.processElement(record(member, "current", current), droppedOutput);
+        droppingContext.setCurrentWatermark(watermark);
+        dropping.processElement(record(member, "late", late), droppedOutput);
+        dropping.onEventTimer(current + GAP_MILLIS, member, droppedOutput);
+
+        assertThat(droppingContext.lateSessionEvents()).isEqualTo(1);
+        assertThat(droppingContext.acceptedLateSessionEvents()).isZero();
+        assertThat(droppedOutput.rows).singleElement().extracting(StreamRecord::value)
+                .isEqualTo(new SessionRow(member, current, current,
+                        current + GAP_MILLIS, 0, 1, List.of("current")));
+
+        TestOperatorContext acceptingContext = new TestOperatorContext();
+        acceptingContext.setCurrentKey(member);
+        SessionAggregator accepting = new SessionAggregator(allowedLateness);
+        accepting.open(acceptingContext);
+        RecordingCollector updatedOutput = new RecordingCollector();
+        accepting.processElement(record(member, "current", current), updatedOutput);
+        acceptingContext.setCurrentWatermark(watermark);
+        accepting.processElement(record(member, "late", late), updatedOutput);
+        accepting.onEventTimer(current + GAP_MILLIS, member, updatedOutput);
+
+        assertThat(acceptingContext.lateSessionEvents()).isZero();
+        assertThat(acceptingContext.acceptedLateSessionEvents()).isEqualTo(1);
+        assertThat(updatedOutput.rows).singleElement().extracting(StreamRecord::value)
+                .isEqualTo(new SessionRow(member, late, current,
+                        current + GAP_MILLIS, current, 2, List.of("current", "late")));
+    }
+
+    private static Properties fixture(String name) throws IOException {
+        Path workingDirectory = Path.of(System.getProperty("user.dir"));
+        Path path = workingDirectory.resolve(Path.of("demos", "fixtures", name));
+        if (!Files.exists(path)) {
+            path = workingDirectory.resolve(Path.of("..", "demos", "fixtures", name)).normalize();
+        }
+        Properties properties = new Properties();
+        try (Reader reader = Files.newBufferedReader(path)) {
+            properties.load(reader);
+        }
+        return properties;
+    }
+
     private static SessionAggregator open(TestOperatorContext context) throws Exception {
         SessionAggregator aggregator = new SessionAggregator();
         aggregator.open(context);
@@ -162,6 +223,8 @@ class SessionAggregatorTest {
         private final List<Long> timers = new ArrayList<>();
         private Object currentKey;
         private long lateSessionEvents;
+        private long acceptedLateSessionEvents;
+        private long currentWatermark = Long.MIN_VALUE;
 
         void setCurrentKey(Object currentKey) {
             this.currentKey = currentKey;
@@ -177,6 +240,14 @@ class SessionAggregatorTest {
 
         long lateSessionEvents() {
             return lateSessionEvents;
+        }
+
+        long acceptedLateSessionEvents() {
+            return acceptedLateSessionEvents;
+        }
+
+        void setCurrentWatermark(long currentWatermark) {
+            this.currentWatermark = currentWatermark;
         }
 
         @Override
@@ -212,7 +283,7 @@ class SessionAggregatorTest {
 
         @Override
         public long currentWatermark() {
-            return Long.MIN_VALUE;
+            return currentWatermark;
         }
 
         @Override
@@ -235,6 +306,24 @@ class SessionAggregatorTest {
                             @Override
                             public long count() {
                                 return lateSessionEvents;
+                            }
+                        };
+                    }
+                    if ("accepted-late-session-events".equals(name)) {
+                        return new Counter() {
+                            @Override
+                            public void increment() {
+                                acceptedLateSessionEvents++;
+                            }
+
+                            @Override
+                            public void increment(long amount) {
+                                acceptedLateSessionEvents += amount;
+                            }
+
+                            @Override
+                            public long count() {
+                                return acceptedLateSessionEvents;
                             }
                         };
                     }

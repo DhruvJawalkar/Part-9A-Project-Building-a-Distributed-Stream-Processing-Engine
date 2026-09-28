@@ -3,7 +3,6 @@ package dev.dhruv.streaming.runtime;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.util.Optional;
@@ -68,7 +67,7 @@ public final class SerializationUtil {
      */
     @SuppressWarnings("unchecked")
     public static <T> T fromBytes(byte[] bytes) {
-        try (ObjectInputStream in = new UserCodeObjectInputStream(
+        try (UserCodeObjectInputStream in = new UserCodeObjectInputStream(
                 new ByteArrayInputStream(bytes))) {
             return (T) in.readObject();
         } catch (IOException | ClassNotFoundException e) {
@@ -76,31 +75,6 @@ public final class SerializationUtil {
                     "could not deserialize a deployed object. The job's classes must be reachable"
                             + " from this process -- see UserCodeClassLoader and the"
                             + " JOB_CLASSPATH environment variable.", e);
-        }
-    }
-
-    /**
-     * An object stream that resolves classes through the user-code loader.
-     *
-     * <p>The default behaviour is the problem this exists to fix. {@link ObjectInputStream}
-     * resolves classes using the nearest classloader on the calling stack, which inside the
-     * engine is the engine's own -- and the engine has never heard of {@code ClickEvent}.
-     * Overriding {@code resolveClass} points it at the loader that does.
-     */
-    private static final class UserCodeObjectInputStream extends ObjectInputStream {
-
-        UserCodeObjectInputStream(java.io.InputStream in) throws IOException {
-            super(in);
-        }
-
-        @Override
-        protected Class<?> resolveClass(java.io.ObjectStreamClass description)
-                throws IOException, ClassNotFoundException {
-            try {
-                return Class.forName(description.getName(), false, UserCodeClassLoader.get());
-            } catch (ClassNotFoundException e) {
-                return super.resolveClass(description);
-            }
         }
     }
 

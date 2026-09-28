@@ -6,7 +6,6 @@ import dev.dhruv.streaming.api.state.StateHandle;
 import dev.dhruv.streaming.api.state.ValueState;
 
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.net.URI;
@@ -67,7 +66,8 @@ public final class InMemoryStateBackend implements StateBackend {
     public synchronized void restore(StateHandle handle) throws IOException {
         Objects.requireNonNull(handle, "handle");
         Path snapshot = pathFor(handle.uri());
-        try (ObjectInputStream input = new ObjectInputStream(Files.newInputStream(snapshot))) {
+        try (UserCodeObjectInputStream input =
+                     new UserCodeObjectInputStream(Files.newInputStream(snapshot))) {
             Object restored = input.readObject();
             if (!(restored instanceof Snapshot state)) {
                 throw new IOException("state handle does not contain an in-memory state snapshot");

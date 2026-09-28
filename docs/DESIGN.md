@@ -358,16 +358,42 @@ checkpoint-completion path.
   atomically appends missing paths after a completed checkpoint. Its current-table path check makes
   completion replay idempotent; aborted or lost intervals leave unreachable object-store orphans.
 
-## Observability
+## Phase 7 observability and demonstrations
 
-Implemented metrics include per-subtask record counts and the latest checkpoint id, snapshot
-duration, state size in bytes, and barrier-alignment time. Worker heartbeats carry these samples,
-and the master retains the latest status per physical task; Phase 7 exposes that registry through
-scrape endpoints and dashboards.
+The master exposes job, vertex, task, checkpoint, source-lag, and cancellation resources through a
+small JDK HTTP server. The same server publishes Prometheus text on `/metrics`; each worker has a
+separate scrape server. These are projections of existing control-plane objects—`JobMaster`,
+`MetadataStore`, checkpoint history, and heartbeat `TaskStatus`—so the UI cannot disagree with the
+state used for scheduling and recovery.
 
-**Planned Phase 7:** REST status, Prometheus endpoints and Grafana panels for source lag,
-checkpoint duration/alignment, records-in skew and state size. Scripted fixture demos will cover
-worker loss mid-window, master loss, a late event and a hot key.
+Worker heartbeats carry per-subtask record counts, watermark, bounded-input queue occupancy,
+backpressure, latest checkpoint duration/alignment/state bytes, and Kafka partition lag. The
+source samples `endOffsets - nextOffsets` on its poll thread at most once per second, then exposes
+an immutable cached snapshot to heartbeat collection. This avoids calling `KafkaConsumer` from a
+second thread. Lag time remains `null`: the age of unread records cannot be derived truthfully from
+offsets alone.
+
+The status contract exposes its persistence boundary. Admission `startedAt` is held by the current
+master and is null after recovery; per-task watermark is null until heartbeats carry that value;
+checkpoint history is current-master operational memory while etcd stores only the latest durable
+recovery point. These values are never reconstructed from wall-clock guesses.
+
+Prometheus series keep job/operator/subtask/worker labels. Grafana provisions four panels only:
+source lag; checkpoint duration and alignment; records-in per subtask; and state size per subtask.
+The four scripts under `demos/` bind each panel or state transition to a fixed proof: worker loss,
+master loss, late data, and a hot key.
+
+The hot-key fix is an optional 16-way two-stage session topology. A deterministic payload salt
+routes `(member,salt)` to local incremental aggregators; compact closed fragments then shuffle by
+member to a global merge. The global stage waits one extra gap before publication so every local
+fragment is complete, while the output's business session end is unchanged. Unsalted and salted
+fixed replays produce identical rows. Since events lack immutable ids, identical payloads retain
+the same salt to preserve replay determinism.
+
+Late-data behavior is explicit. The default session operator drops an event behind the watermark;
+an allowed-lateness constructor may revise the retained open session. It does not reopen an
+already-emitted row, because the engine has neither historical-window retention nor an Iceberg
+upsert/equality-delete contract.
 
 ## Deliberate limitations
 
@@ -376,5 +402,5 @@ security/multi-tenancy/resource isolation. Checkpoint recovery, interval joining
 output for completed checkpoint intervals in unpartitioned Iceberg tables are implemented.
 Non-transactional console sinks remain at-least-once. Bounded sources do not yet coordinate a
 terminal checkpoint, so their post-last-barrier transactional output is deliberately not claimed;
-the LMS production topology uses unbounded Kafka sources. Operational APIs remain planned. These omissions are visible so the code shows
+the LMS production topology uses unbounded Kafka sources. These omissions are visible so the code shows
 which production-system mechanism solves each problem.

@@ -78,6 +78,12 @@ public final class UserCodeClassLoader {
         instance = new URLClassLoader(
                 "user-code", urls.toArray(URL[]::new), UserCodeClassLoader.class.getClassLoader());
 
+        // Libraries loaded as user code commonly perform their own reflective discovery through
+        // the thread context class loader. Iceberg does this for its AWS HTTP client, for example.
+        // Installing the loader here also makes subsequently-created gRPC and task threads inherit
+        // it, while shared engine types still resolve parent-first through the URLClassLoader.
+        Thread.currentThread().setContextClassLoader(instance);
+
         log.info("user code will be loaded from {} classpath entr{}",
                 urls.size(), urls.size() == 1 ? "y" : "ies");
     }

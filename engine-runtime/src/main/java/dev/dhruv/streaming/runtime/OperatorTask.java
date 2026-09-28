@@ -18,7 +18,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.net.URI;
@@ -439,7 +438,8 @@ public final class OperatorTask implements Runnable {
 
     private void restoreCheckpoint(StateHandle taskHandle) throws IOException {
         Path envelope = filePath(taskHandle.uri());
-        try (ObjectInputStream input = new ObjectInputStream(Files.newInputStream(envelope))) {
+        try (UserCodeObjectInputStream input =
+                     new UserCodeObjectInputStream(Files.newInputStream(envelope))) {
             Object value = input.readObject();
             if (!(value instanceof OperatorSnapshot snapshot)) {
                 throw new IOException("operator checkpoint has an unexpected payload");

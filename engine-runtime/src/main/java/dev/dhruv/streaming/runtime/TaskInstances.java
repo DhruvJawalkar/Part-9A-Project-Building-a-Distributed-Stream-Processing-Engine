@@ -3,7 +3,6 @@ package dev.dhruv.streaming.runtime;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 
 /**
@@ -51,8 +50,9 @@ final class TaskInstances {
             try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
                 out.writeObject(original);
             }
-            try (ObjectInputStream in =
-                         new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            try (UserCodeObjectInputStream in =
+                         new UserCodeObjectInputStream(
+                                 new ByteArrayInputStream(bytes.toByteArray()))) {
                 return (T) in.readObject();
             }
         } catch (IOException | ClassNotFoundException e) {

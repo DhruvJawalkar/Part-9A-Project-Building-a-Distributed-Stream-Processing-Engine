@@ -33,6 +33,7 @@ public final class MasterBootstrap implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(MasterBootstrap.class);
 
     private final int port;
+    private final int statusPort;
     private final MetadataStore metadata;
     private final GrpcTaskDeployer deployer;
     private final JobMaster jobMaster;
@@ -40,6 +41,7 @@ public final class MasterBootstrap implements AutoCloseable {
 
     private Server server;
     private AutoCloseable workerWatch;
+    private StatusApi statusApi;
 
     /**
      * Creates a master.
@@ -57,7 +59,17 @@ public final class MasterBootstrap implements AutoCloseable {
                            String etcdEndpoints,
                            CheckpointCoordinator.Config checkpointConfig,
                            RestartStrategy restartStrategy) {
+        this(port, 8080, etcdEndpoints, checkpointConfig, restartStrategy);
+    }
+
+    /** Creates a master with independent gRPC and operator-status ports. */
+    public MasterBootstrap(int port,
+                           int statusPort,
+                           String etcdEndpoints,
+                           CheckpointCoordinator.Config checkpointConfig,
+                           RestartStrategy restartStrategy) {
         this.port = port;
+        this.statusPort = statusPort;
         this.metadata = new EtcdMetadataStore(etcdEndpoints);
         this.deployer = new GrpcTaskDeployer();
         this.jobMaster = new JobMaster(metadata, deployer, checkpointConfig, restartStrategy);
@@ -70,6 +82,8 @@ public final class MasterBootstrap implements AutoCloseable {
      * @throws IOException if the port cannot be bound
      */
     public void start() throws IOException {
+        statusApi = new StatusApi(statusPort, jobMaster, metadata);
+        statusApi.start();
         server = NettyServerBuilder.forPort(port)
                 .addService(service)
                 .maxInboundMessageSize(64 * 1024 * 1024)
@@ -88,7 +102,7 @@ public final class MasterBootstrap implements AutoCloseable {
                 log.info("recovered job {} in state {} with {} assignment(s)",
                         jobId, job.state(), job.assignments().size()));
 
-        log.info("master listening on port {}", port);
+        log.info("master listening: gRPC :{}, status and metrics :{}", port, statusApi.port());
     }
 
     /**
@@ -147,6 +161,9 @@ public final class MasterBootstrap implements AutoCloseable {
             }
         }
         jobMaster.close();
+        if (statusApi != null) {
+            statusApi.close();
+        }
         deployer.close();
         if (server != null) {
             server.shutdown();
@@ -170,6 +187,7 @@ public final class MasterBootstrap implements AutoCloseable {
      */
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(env("MASTER_PORT", "9090"));
+        int statusPort = Integer.parseInt(env("MASTER_STATUS_PORT", "8080"));
         String etcd = env("ETCD_ENDPOINTS", "http://localhost:2379");
         Duration checkpointInterval = Duration.ofMillis(Long.parseLong(
                 env("CHECKPOINT_INTERVAL_MS", "10000")));
@@ -184,7 +202,7 @@ public final class MasterBootstrap implements AutoCloseable {
         // worker does. Flink's JobManager has the same requirement, for the same reason.
         UserCodeClassLoader.configure(System.getenv("JOB_CLASSPATH"));
 
-        MasterBootstrap master = new MasterBootstrap(port, etcd,
+        MasterBootstrap master = new MasterBootstrap(port, statusPort, etcd,
                 new CheckpointCoordinator.Config(checkpointInterval, checkpointTimeout),
                 new RestartStrategy(restartAttempts, restartDelay));
         Runtime.getRuntime().addShutdownHook(new Thread(master::close, "shutdown"));

@@ -87,6 +87,22 @@ message TaskStatus {
   int64 last_checkpoint_duration_millis = 7;
   int64 last_checkpoint_state_bytes = 8;
   int64 last_alignment_millis = 9;
+
+  // A task is backpressured only when its bounded input gate is full. Carrying the raw queue
+  // and capacity alongside the boolean makes the operational claim inspectable.
+  bool backpressured = 10;
+  int64 input_queued_elements = 11;
+  int64 input_capacity = 12;
+  bool source_lag_available = 13;
+  repeated SourcePartitionLag source_lag = 14;
+}
+
+// Offset lag is a source-thread sample. Kafka does not offer a safe unread-record age, so the
+// status API exposes maxLagMillis as null until a connector can supply it.
+message SourcePartitionLag {
+  string topic = 1;
+  int32 partition = 2;
+  int64 lag_records = 3;
 }
 
 // Commands travel back down the heartbeat stream rather than over a separate call, so the

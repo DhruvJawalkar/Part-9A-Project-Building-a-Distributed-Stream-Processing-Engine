@@ -59,7 +59,7 @@ public final class LmsClickstreamJob {
      * @throws InterruptedException if the main thread is interrupted while the job runs
      */
     public static void main(String[] args) throws InterruptedException {
-        JobGraph graph = buildGraph();
+        JobGraph graph = buildGraph(SessionAggregationMode.fromSystemProperty());
 
         try (JobExecutor execution = JobExecutors.local(graph)) {
             Runtime.getRuntime().addShutdownHook(new Thread(execution::close, "shutdown"));
@@ -77,6 +77,18 @@ public final class LmsClickstreamJob {
      * @return the validated job graph
      */
     public static JobGraph buildGraph() {
+        return buildGraph(SessionAggregationMode.UNSALTED);
+    }
+
+    /**
+     * Describes the job with the requested session aggregation topology.
+     *
+     * <p>The executable entry point selects this with {@code -Dlms.sessions.salted=true}; the
+     * no-argument builder remains unsalted so embedders and tests never inherit process-global
+     * configuration accidentally.
+     */
+    public static JobGraph buildGraph(SessionAggregationMode sessionAggregation) {
+        java.util.Objects.requireNonNull(sessionAggregation, "sessionAggregation");
         JobGraph.Builder job = JobGraph.named("lms-clickstream");
 
         DataStream<ClickEvent> clicks =
@@ -94,10 +106,7 @@ public final class LmsClickstreamJob {
         DataStream<ClickEvent> cleanClicks = clicks.filter("drop-bots", new BotFilter())
                 .parallelism(4);
 
-        cleanClicks
-                .keyBy("by-member", ClickEvent::memberId)
-                .process("sessions", new SessionAggregator())
-                .parallelism(4)
+        sessionStream(cleanClicks, sessionAggregation)
                 .sink("browse-sessions", LmsIcebergOutputs.browseSessionsSink())
                 // A single writer gives each table one atomic interval append.
                 .parallelism(1);
@@ -127,5 +136,36 @@ public final class LmsClickstreamJob {
                 .parallelism(1);
 
         return job.build();
+    }
+
+    private static DataStream<SessionRow> sessionStream(DataStream<ClickEvent> cleanClicks,
+                                                         SessionAggregationMode mode) {
+        if (mode == SessionAggregationMode.UNSALTED) {
+            return cleanClicks.keyBy("by-member", ClickEvent::memberId)
+                    .process("sessions", new SessionAggregator())
+                    .parallelism(4);
+        }
+
+        DataStream<SaltedSessionAggregator.SaltedClickEvent> salted = cleanClicks
+                .process("salt-session-events", new SaltedSessionAggregator.Salter())
+                .parallelism(4);
+        DataStream<SaltedSessionAggregator.SessionSegment> local = salted
+                .keyBy("by-member-and-salt", SaltedSessionAggregator.SaltedClickEvent::key)
+                .process("local-sessions", new SaltedSessionAggregator.LocalSessionAggregator())
+                .parallelism(4);
+        return local.keyBy("by-member", SaltedSessionAggregator.SessionSegment::memberId)
+                .process("sessions", new SaltedSessionAggregator.GlobalSessionAggregator())
+                .parallelism(4);
+    }
+
+    /** The selectable topology for the browse-session branch. */
+    public enum SessionAggregationMode {
+        UNSALTED,
+        SALTED;
+
+        static SessionAggregationMode fromSystemProperty() {
+            return Boolean.parseBoolean(System.getProperty("lms.sessions.salted", "false"))
+                    ? SALTED : UNSALTED;
+        }
     }
 }

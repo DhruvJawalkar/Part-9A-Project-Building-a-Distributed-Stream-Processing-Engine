@@ -246,6 +246,11 @@ public final class InputGate {
         }
     }
 
+    /** Returns the bounded capacity across all input channels, for observable backpressure. */
+    public int totalCapacity() {
+        return channelCount() * capacityPerChannel;
+    }
+
     /**
      * An element together with the channel it arrived on.
      *

@@ -3,10 +3,13 @@ package dev.dhruv.streaming.worker;
 import dev.dhruv.streaming.runtime.OperatorTask;
 import dev.dhruv.streaming.runtime.SourceTask;
 import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
+import dev.dhruv.streaming.runtime.transport.InputGate;
+import dev.dhruv.streaming.api.SourceLagReporter;
 import dev.dhruv.streaming.runtime.transport.Output;
 
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.CompletableFuture;
+import java.util.Optional;
 
 /**
  * One task running on this worker, with what is needed to watch it and stop it.
@@ -20,6 +23,7 @@ import java.util.concurrent.CompletableFuture;
  * @param thread       the thread running it
  * @param output       its outgoing channels, closed when the task is cancelled
  * @param metrics      its metrics, reported on the heartbeat
+ * @param inputGate    its bounded inbound queues, the direct evidence for backpressure
  */
 record RunningTask(
         String taskKey,
@@ -31,7 +35,8 @@ record RunningTask(
         Thread thread,
         Output output,
         ScheduledFuture<?> bufferFlush,
-        TaskMetricGroup metrics
+        TaskMetricGroup metrics,
+        InputGate inputGate
 ) {
 
     /**
@@ -108,6 +113,27 @@ record RunningTask(
 
     long lastAlignmentMillis() {
         return checkpointMetrics().alignmentMillis();
+    }
+
+    int inputQueuedElements() {
+        return inputGate.queuedElements();
+    }
+
+    int inputCapacity() {
+        return inputGate.totalCapacity();
+    }
+
+    /** A producer blocks only once every inbound channel is full. */
+    boolean isBackpressured() {
+        return inputCapacity() > 0 && inputQueuedElements() >= inputCapacity();
+    }
+
+    boolean supportsSourceLag() {
+        return task instanceof SourceTask source && source.supportsSourceLag();
+    }
+
+    Optional<SourceLagReporter.SourceLag> sourceLag() {
+        return task instanceof SourceTask source ? source.sourceLag() : Optional.empty();
     }
 
     private CheckpointMetrics checkpointMetrics() {

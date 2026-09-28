@@ -38,7 +38,7 @@ The target shape, from §4.1 of the companion PDF:
                                                        +----------------+
 ```
 
-**As of Phase 6 the control, data, checkpoint and transactional-output paths are real.** A master process serves
+**All seven phases are implemented.** A master process serves
 `MasterService` on :7000;
 three worker processes serve `WorkerService` and `DataTransportService` on separate ports and
 register in etcd under a TTL lease. Records cross process boundaries over gRPC with credit-based
@@ -48,7 +48,8 @@ injects source barriers and receives task checkpoint acknowledgements. Workers a
 snapshots in MinIO, while etcd stores the pointer and per-task handles only after the whole
 checkpoint completes. The Iceberg REST catalog stores table metadata in the MinIO warehouse, and
 the LMS sinks publish completed checkpoint intervals to Iceberg only after that durable pointer
-write. `StatusApi` and the dashboard remain Phase 7 work.
+write. `StatusApi`, worker metrics servers, Prometheus, and Grafana expose the live task state
+used by the runtime instead of maintaining a second observability model.
 
 `LocalJobExecutor` remains, and is still the right tool for tests and demos -- a determinism test
 comparing two runs of one fixture does not get more convincing by involving three processes.
@@ -338,6 +339,83 @@ The session branch remains keyed by `memberId`; the conversion branch is keyed b
 checkpoint-transactional Iceberg sinks: `lms.analytics.browse_sessions` and
 `lms.analytics.click_conversions`.
 
+## Phase 7 observability and operational topology
+
+The REST layer is deliberately a projection of master-owned state. It does not schedule work or
+introduce a second job model:
+
+```text
+workers -- heartbeat(TaskStatus + partition lag) --> JobMaster
+   |                                                   |
+   +-- /metrics (:8081)                                +-- /jobs/... (:8080)
+   |                                                   +-- /metrics (:8080)
+   +-------------------------- Prometheus <------------+
+                                      |
+                                      v
+                            provisioned Grafana dashboard
+```
+
+`TaskStatus` carries records in/out, watermark, checkpoint duration/alignment/state bytes, real
+input-queue occupancy, and Kafka source partition lag. The `backpressured` value is derived from
+the bounded `InputGate` rather than guessed from throughput. `KafkaSource` samples broker end
+offsets on its own poll thread at most once per second; the reporting thread reads the cached
+snapshot, preserving KafkaConsumer's single-threaded contract. Lag in records is exact at the
+sample. Unread-record age is not derivable without fetching those records, so `maxLagMillis` is
+explicitly `null` instead of a fabricated value.
+
+`startedAt` is the current master's admission time and becomes `null` after master recovery; the
+metadata schema does not persist a submission timestamp. Per-task `watermark` is also `null`
+because it has not yet been added to heartbeats. Checkpoint counts and history are operational
+state for the current master, while etcd intentionally persists only the latest complete recovery
+point. These gaps are surfaced as null or reset values rather than inferred from unrelated clocks.
+
+Prometheus retains `job`, `operator`, `subtask`, and (on workers) `worker` labels. Those labels are
+not presentation detail: Demo 4 depends on seeing one session subtask saturate while its siblings
+are idle. Grafana provisions exactly four panels: source lag; checkpoint duration and alignment;
+records-in per subtask; and checkpoint state size per subtask.
+
+The Compose stack is also the deployment specification. One multi-stage Dockerfile builds master,
+worker, LMS, and submitter artifacts. Three worker containers advertise service-discovery names
+to the master; etcd stores control-plane state; MinIO stores checkpoint archives and the Iceberg
+warehouse. One-shot services create topics, buckets, Iceberg schemas, submit the graph, and publish
+the fixed fixtures. Consequently `docker compose up -d --build` starts an inspectable system, not
+just its dependencies.
+
+### Skew mitigation topology
+
+The normal session branch uses `HASH(memberId)`, which is exact but gives one hot member to one
+subtask. The optional `-Dlms.sessions.salted=true` path introduces two visible stages:
+
+```text
+ClickEvent
+  -> deterministic salt(payload) in [0, 16)
+  -> HASH(memberId, salt)
+  -> local incremental session fragment
+  -> HASH(memberId)
+  -> global fragment merge
+  -> SessionRow
+```
+
+Local shards close ordinary session fragments. The global merge waits an extra session gap so
+fragments from every salt have become event-time complete, but retains the normal business end in
+the output row. State remains incremental: compact counts and distinct search terms cross the
+second shuffle, never the original event list. Since `ClickEvent` has no immutable event id,
+identical payloads choose the same stable salt; this is required for deterministic replay.
+
+The unsalted and salted fixed-replay acceptance paths emit identical rows. The hot-key fixture
+also models the actual key-group mapping: the unsalted owner exceeds its service capacity while
+three siblings receive nothing, whereas salted local keys use all four subtasks below capacity.
+
+### Late-data policy
+
+The zero-argument `SessionAggregator` drops and counts an event behind the current watermark.
+Supplying an allowed-lateness duration may revise the still-retained open session and increments a
+separate accepted-late counter. Closed sessions are not kept for later rewriting, and the Iceberg
+sink is append-only. Reopening historical output would require an upsert/equality-delete contract;
+the engine reports this boundary rather than implying that an append is an overwrite.
+
+---
+
 ## Component table
 
 | Component | Lives in | Responsibility | Phase |
@@ -385,6 +463,8 @@ checkpoint-transactional Iceberg sinks: `lms.analytics.browse_sessions` and
 | `IntervalJoinOperator` | engine-api | Keyed, timestamp-bounded matching with separate left/right `ListState` and cleanup gauges | 5 |
 | `IcebergSink` | engine-connectors | One Parquet writer per checkpoint interval; pending file state and idempotent current-table append for unpartitioned Iceberg tables | 6 |
 | `StatusApi` | engine-master | REST endpoints and Prometheus scrape | 7 |
+| `WorkerMetricsServer` | engine-worker | Per-task Prometheus scrape with queue and checkpoint metrics | 7 |
+| `SaltedSessionAggregator` | lms-job | Deterministic local-then-global session aggregation for hot keys | 7 |
 
 ---
 

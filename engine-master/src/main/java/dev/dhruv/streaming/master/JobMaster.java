@@ -24,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Set;
 
 /**
@@ -62,6 +63,7 @@ public final class JobMaster implements AutoCloseable {
     private final Map<String, JobGraph> jobGraphs = new ConcurrentHashMap<>();
     private final Map<String, ExecutionGraph> executionGraphs = new ConcurrentHashMap<>();
     private final Map<String, Integer> restartAttempts = new ConcurrentHashMap<>();
+    private final Map<String, Instant> startedAt = new ConcurrentHashMap<>();
     private final Map<String, Set<String>> finishedTasks = new ConcurrentHashMap<>();
     private final Map<String, Map<String, TaskStatus>> taskStatuses = new ConcurrentHashMap<>();
     private final Set<String> quarantinedWorkers = ConcurrentHashMap.newKeySet();
@@ -150,6 +152,7 @@ public final class JobMaster implements AutoCloseable {
         // RUNNING before deploying, not after. A task that starts processing under a master
         // that still believes the job is CREATED is a task nobody is watching.
         metadata.putJobState(jobId, JobState.RUNNING);
+        startedAt.put(jobId, Instant.now());
         try {
             deployer.deploy(graph, plan, workers);
         } catch (RuntimeException deploymentFailure) {
@@ -283,6 +286,59 @@ public final class JobMaster implements AutoCloseable {
     /** Exposes one deterministic trigger for tests and demo scripts. */
     public Optional<Long> triggerCheckpoint(String jobId) {
         return checkpoints.trigger(jobId);
+    }
+
+    /**
+     * Stops a job at an operator's request without pretending that cancellation is a failure.
+     *
+     * <p>Cancellation is deliberately terminal. A restart would contradict the caller's request
+     * and, unlike failure recovery, has no reason to preserve an in-flight checkpoint.
+     *
+     * @return false when no live job by this id exists
+     */
+    public synchronized boolean cancelJob(String jobId) {
+        Optional<JobState> current = metadata.getJobState(jobId);
+        if (current.isEmpty() || current.get().isTerminal()) {
+            return false;
+        }
+        metadata.putJobState(jobId, JobState.CANCELLED);
+        ExecutionGraph plan = executionGraphs.get(jobId);
+        if (plan != null) {
+            deployer.cancelAll(jobId, plan);
+        }
+        checkpoints.stop(jobId);
+        log.info("job {} cancelled through the status API", jobId);
+        return true;
+    }
+
+    /** Returns the id of the one incomplete checkpoint, if the coordinator currently has one. */
+    public Optional<Long> inFlightCheckpoint(String jobId) {
+        return checkpoints.inFlightCheckpoint(jobId);
+    }
+
+    /** Number of whole-job recovery attempts made since this master started supervising the job. */
+    public int restartCount(String jobId) {
+        return restartAttempts.getOrDefault(jobId, 0);
+    }
+
+    /** Checkpoint cadence used by the status API. */
+    public long checkpointIntervalMillis() {
+        return checkpoints.intervalMillis();
+    }
+
+    /** Current coordinator counters for one job; they are deliberately process-local metrics. */
+    public CheckpointCoordinator.Status checkpointStatus(String jobId) {
+        return checkpoints.status(jobId);
+    }
+
+    /** Logical job name when this master has its graph in memory. */
+    public Optional<String> jobName(String jobId) {
+        return Optional.ofNullable(jobGraphs.get(jobId)).map(JobGraph::name);
+    }
+
+    /** Time this master admitted the currently running job generation, if known. */
+    public Optional<Instant> startedAt(String jobId) {
+        return Optional.ofNullable(startedAt.get(jobId));
     }
 
     /**

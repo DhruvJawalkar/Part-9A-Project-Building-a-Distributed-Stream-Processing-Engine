@@ -3,6 +3,7 @@ package dev.dhruv.streaming.connectors.kafka;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dhruv.streaming.api.CheckpointableSource;
+import dev.dhruv.streaming.api.SourceLagReporter;
 import dev.dhruv.streaming.api.Collector;
 import dev.dhruv.streaming.api.SourceContext;
 import dev.dhruv.streaming.api.metrics.Counter;
@@ -31,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Properties;
 
 /**
@@ -43,7 +45,7 @@ import java.util.Properties;
  *
  * @param <T> the record type, deserialized from JSON
  */
-public final class KafkaSource<T> implements CheckpointableSource<T> {
+public final class KafkaSource<T> implements CheckpointableSource<T>, SourceLagReporter {
 
     private static final long serialVersionUID = 1L;
     private static final Logger log = LoggerFactory.getLogger(KafkaSource.class);
@@ -59,6 +61,8 @@ public final class KafkaSource<T> implements CheckpointableSource<T> {
     private transient List<TopicPartition> assignedPartitions;
     private transient Map<TopicPartition, Long> nextOffsets;
     private transient Map<TopicPartition, Long> restoredOffsets;
+    private transient volatile Optional<SourceLag> latestLag = Optional.empty();
+    private transient long lastLagSampleNanos;
 
     private KafkaSource(String topic, Class<T> valueType, String bootstrapServers) {
         this.topic = Objects.requireNonNull(topic, "topic");
@@ -144,7 +148,48 @@ public final class KafkaSource<T> implements CheckpointableSource<T> {
             // forever after recovery would pin the partition.
             nextOffsets.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
         }
+        sampleLagIfDue();
         return true;
+    }
+
+    /**
+     * KafkaConsumer is confined to the source task thread, so this samples here rather than in a
+     * metrics scrape. Offset lag is exact at the instant endOffsets returns; Kafka cannot supply
+     * a safe age for an unread end offset without reading the record, so maxLagMillis stays absent.
+     */
+    private void sampleLagIfDue() {
+        long now = System.nanoTime();
+        if (now - lastLagSampleNanos < Duration.ofSeconds(1).toNanos()) {
+            return;
+        }
+        try {
+            Map<TopicPartition, Long> ends = consumer.endOffsets(assignedPartitions);
+            latestLag = Optional.of(lagSnapshot(assignedPartitions, ends, nextOffsets));
+            lastLagSampleNanos = now;
+        } catch (RuntimeException failure) {
+            // A lag sample must not make a healthy data plane fail. Preserve the last truthful
+            // sample and try again on the next cadence.
+            log.debug("could not sample Kafka lag for topic {}", topic, failure);
+            lastLagSampleNanos = now;
+        }
+    }
+
+    @Override
+    public Optional<SourceLag> sourceLag() {
+        return latestLag == null ? Optional.empty() : latestLag;
+    }
+
+    /** Pure conversion kept separate so lag arithmetic is testable without a Kafka broker. */
+    static SourceLag lagSnapshot(List<TopicPartition> assigned,
+                                 Map<TopicPartition, Long> ends,
+                                 Map<TopicPartition, Long> next) {
+        List<PartitionLag> partitions = assigned.stream().sorted(Comparator
+                        .comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition))
+                .map(partition -> new PartitionLag(partition.topic(), partition.partition(),
+                        Math.max(0, ends.getOrDefault(partition, 0L)
+                                - next.getOrDefault(partition, 0L))))
+                .toList();
+        return new SourceLag(partitions, OptionalLong.empty());
     }
 
     @Override

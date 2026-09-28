@@ -37,14 +37,17 @@ public enum JobState {
     RESTARTING,
 
     /** Terminal: no recovery point or no restart attempt remained. */
-    FAILED;
+    FAILED,
+
+    /** Terminal: an operator deliberately stopped the job through the status API. */
+    CANCELLED;
 
     /**
      * Returns whether this state admits no further transitions.
      *
-     * @return true for {@code FINISHED} and {@code FAILED}
+     * @return true for {@code FINISHED}, {@code FAILED} and {@code CANCELLED}
      */
     public boolean isTerminal() {
-        return this == FINISHED || this == FAILED;
+        return this == FINISHED || this == FAILED || this == CANCELLED;
     }
 }

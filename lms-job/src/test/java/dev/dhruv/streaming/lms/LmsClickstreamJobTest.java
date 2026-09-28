@@ -94,6 +94,32 @@ class LmsClickstreamJobTest {
     }
 
     @Test
+    @DisplayName("can replace the hot session key with legible local and global aggregation stages")
+    void saltedSessionsUseTwoHashExchanges() {
+        JobGraph graph = LmsClickstreamJob.buildGraph(
+                LmsClickstreamJob.SessionAggregationMode.SALTED);
+
+        assertThat(graph.operators()).extracting(LogicalOperator::id)
+                .containsSubsequence("drop-bots", "salt-session-events", "local-sessions",
+                        "sessions", "browse-sessions");
+        assertThat(((TransformNode) graph.operator("salt-session-events").orElseThrow())
+                .inputExchange())
+                .isEqualTo(ExchangeStrategy.FORWARD);
+        TransformNode local = (TransformNode) graph.operator("local-sessions").orElseThrow();
+        TransformNode global = (TransformNode) graph.operator("sessions").orElseThrow();
+        assertThat(local.inputExchange()).isEqualTo(ExchangeStrategy.HASH);
+        assertThat(local.partitionName()).contains("by-member-and-salt");
+        assertThat(local.operator()).isInstanceOf(SaltedSessionAggregator.LocalSessionAggregator.class);
+        assertThat(global.inputExchange()).isEqualTo(ExchangeStrategy.HASH);
+        assertThat(global.partitionName()).contains("by-member");
+        assertThat(global.operator()).isInstanceOf(SaltedSessionAggregator.GlobalSessionAggregator.class);
+
+        JobGraph restored = SerializationUtil.fromBytes(SerializationUtil.toBytes(graph));
+        assertThat(restored.operator("local-sessions")).isPresent();
+        assertThat(restored.operator("sessions")).isPresent();
+    }
+
+    @Test
     @DisplayName("unions tagged inputs before hashing conversions by member and item")
     void conversionsAreAKeyedTwoSidedIntervalJoin() {
         JobGraph graph = LmsClickstreamJob.buildGraph();

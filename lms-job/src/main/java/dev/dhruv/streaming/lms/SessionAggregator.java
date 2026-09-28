@@ -31,10 +31,31 @@ public final class SessionAggregator
     /** The business definition of one uninterrupted catalog-browsing session. */
     public static final Duration SESSION_GAP = Duration.ofMinutes(15);
 
+    private final long allowedLatenessMillis;
+
     private transient OperatorContext context;
     private transient ValueState<SessionAccumulator> session;
     private transient ValueState<Long> windowEnd;
     private transient Counter lateSessionEvents;
+    private transient Counter acceptedLateSessionEvents;
+
+    /** Creates the normal policy: an event behind the current watermark is dropped. */
+    public SessionAggregator() {
+        this(Duration.ZERO);
+    }
+
+    /**
+     * Creates a session operator which may revise an open session for this long behind the
+     * watermark. The engine deliberately retains only the current open session, so an event
+     * outside that session's gap is still dropped rather than recreating historical windows.
+     */
+    public SessionAggregator(Duration allowedLateness) {
+        Objects.requireNonNull(allowedLateness, "allowedLateness");
+        if (allowedLateness.isNegative()) {
+            throw new IllegalArgumentException("allowed lateness must not be negative");
+        }
+        this.allowedLatenessMillis = allowedLateness.toMillis();
+    }
 
     @Override
     public void open(OperatorContext context) {
@@ -42,6 +63,7 @@ public final class SessionAggregator
         session = context.getValueState("session-accumulator", SessionAccumulator.class);
         windowEnd = context.getValueState("session-window-end", Long.class);
         lateSessionEvents = context.metrics().counter("late-session-events");
+        acceptedLateSessionEvents = context.metrics().counter("accepted-late-session-events");
     }
 
     @Override
@@ -51,9 +73,17 @@ public final class SessionAggregator
         ClickEvent event = Objects.requireNonNull(record.value(), "record.value");
         Long previousEnd = windowEnd.value().orElse(null);
         SessionAccumulator existing = session.value().orElse(null);
+        boolean behindWatermark = isBehindWatermark(record.timestamp());
+        if (behindWatermark && exceedsAllowedLateness(record.timestamp())) {
+            lateSessionEvents.increment();
+            return;
+        }
         if (existing != null && isTooLateToMerge(record.timestamp(), existing)) {
             lateSessionEvents.increment();
             return;
+        }
+        if (behindWatermark) {
+            acceptedLateSessionEvents.increment();
         }
 
         if (existing != null && previousEnd != null && record.timestamp() > previousEnd) {
@@ -97,5 +127,17 @@ public final class SessionAggregator
     private static boolean isTooLateToMerge(long eventTimeMillis, SessionAccumulator existing) {
         return eventTimeMillis < Math.subtractExact(existing.sessionStartMillis(),
                 SESSION_GAP.toMillis());
+    }
+
+    private boolean isBehindWatermark(long eventTimeMillis) {
+        long watermark = context.currentWatermark();
+        return watermark != Long.MIN_VALUE && eventTimeMillis < watermark;
+    }
+
+    private boolean exceedsAllowedLateness(long eventTimeMillis) {
+        long watermark = context.currentWatermark();
+        long cutoff = watermark < Long.MIN_VALUE + allowedLatenessMillis
+                ? Long.MIN_VALUE : watermark - allowedLatenessMillis;
+        return eventTimeMillis < cutoff;
     }
 }

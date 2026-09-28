@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shared engine-process logging. Lifecycle events remain visible without allowing dependency
+     DEBUG traffic to dominate the worker and delay checkpoint-transactional sink callbacks. -->
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="dev.dhruv.streaming" level="INFO"/>
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="io.grpc" level="WARN"/>
+    <logger name="org.apache.hc" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

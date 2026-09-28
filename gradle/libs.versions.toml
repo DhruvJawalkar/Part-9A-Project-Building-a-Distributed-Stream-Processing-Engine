@@ -22,6 +22,7 @@ minio = "8.5.17"
 iceberg = "1.11.0"
 hadoop = "3.3.6"
 parquet = "1.17.1"
+micrometer = "1.12.13"
 
 [libraries]
 junit-bom      = { module = "org.junit:junit-bom",                version.ref = "junit" }
@@ -66,6 +67,10 @@ iceberg-aws-bundle  = { module = "org.apache.iceberg:iceberg-aws-bundle", versio
 hadoop-common       = { module = "org.apache.hadoop:hadoop-common", version.ref = "hadoop" }
 hadoop-mapreduce-client-core = { module = "org.apache.hadoop:hadoop-mapreduce-client-core", version.ref = "hadoop" }
 parquet-avro        = { module = "org.apache.parquet:parquet-avro", version.ref = "parquet" }
+
+# Phase 7: Micrometer owns Prometheus' text exposition format and metric naming rules.
+micrometer-core = { module = "io.micrometer:micrometer-core", version.ref = "micrometer" }
+micrometer-prometheus = { module = "io.micrometer:micrometer-registry-prometheus", version.ref = "micrometer" }
 
 [plugins]
 protobuf = { id = "com.google.protobuf", version.ref = "protobufPlugin" }

@@ -4,6 +4,7 @@ import dev.dhruv.streaming.api.Collector;
 import dev.dhruv.streaming.api.CheckpointBarrier;
 import dev.dhruv.streaming.api.CheckpointableSource;
 import dev.dhruv.streaming.api.Source;
+import dev.dhruv.streaming.api.SourceLagReporter;
 import dev.dhruv.streaming.api.StreamRecord;
 import dev.dhruv.streaming.api.TimestampAssigner;
 import dev.dhruv.streaming.api.Watermark;
@@ -193,6 +194,16 @@ public final class SourceTask implements Runnable {
      */
     public TaskMetricGroup metrics() {
         return metrics;
+    }
+
+    /** Returns the source's cached lag observation without touching the source client. */
+    public Optional<SourceLagReporter.SourceLag> sourceLag() {
+        return source instanceof SourceLagReporter reporter ? reporter.sourceLag() : Optional.empty();
+    }
+
+    /** Whether this source can ever report input lag. */
+    public boolean supportsSourceLag() {
+        return source instanceof SourceLagReporter;
     }
 
     /**

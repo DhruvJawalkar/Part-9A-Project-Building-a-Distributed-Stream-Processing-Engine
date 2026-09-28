@@ -100,6 +100,10 @@ class DistributedCheckpointRecoveryIT {
             ManagedProcess master = startProcess("master", "dev.dhruv.streaming.master.MasterBootstrap",
                     classpath, Map.of(
                             "MASTER_PORT", Integer.toString(masterPort),
+                            // The status endpoint is a second listener. Give every acceptance
+                            // process an ephemeral port so this test can coexist with Compose or
+                            // another build on the developer's machine.
+                            "MASTER_STATUS_PORT", Integer.toString(freePort()),
                             "ETCD_ENDPOINTS", etcdEndpoint,
                             "JOB_CLASSPATH", classpath,
                             // Leave enough space between attempts for the failure detector to
@@ -122,6 +126,7 @@ class DistributedCheckpointRecoveryIT {
                                 Map.entry("WORKER_HOST", "127.0.0.1"),
                                 Map.entry("WORKER_RPC_PORT", Integer.toString(rpcPort)),
                                 Map.entry("WORKER_DATA_PORT", Integer.toString(dataPort)),
+                                Map.entry("WORKER_METRICS_PORT", Integer.toString(freePort())),
                                 Map.entry("WORKER_SLOTS", "8"),
                                 Map.entry("MASTER_HOST", "127.0.0.1"),
                                 Map.entry("MASTER_PORT", Integer.toString(masterPort)),
@@ -156,8 +161,11 @@ class DistributedCheckpointRecoveryIT {
                     .isZero();
 
             Map<String, String> initialAssignments = metadata.getAssignments(graph.jobId());
-            int alphaSubtask = KeyGroupAssigner.subtaskFor("member-alpha", 3);
-            String killedWorkerId = initialAssignments.get("sessions:" + alphaSubtask);
+            // member-beta maps to session subtask 2 at this parallelism. That task does not
+            // share worker placement with the singleton sink in this deterministic plan, so
+            // the intentional kill cannot race the just-completed sink notification.
+            int sessionSubtask = KeyGroupAssigner.subtaskFor("member-beta", 3);
+            String killedWorkerId = initialAssignments.get("sessions:" + sessionSubtask);
             assertThat(killedWorkerId).isNotBlank();
             ManagedProcess killed = Objects.requireNonNull(workers.get(killedWorkerId));
             killed.process().destroyForcibly();
@@ -199,8 +207,8 @@ class DistributedCheckpointRecoveryIT {
         }
         byte[] bytes = Files.readAllBytes(output);
         assertThat(new String(bytes, StandardCharsets.UTF_8)).isEqualTo(String.join("\n",
-                "member-alpha|18000|20000|920000|2000|2|first,second",
-                "member-alpha|2000000|2000000|2900000|0|1|future") + "\n");
+                "member-beta|18000|20000|920000|2000|2|first,second",
+                "member-beta|2000000|2000000|2900000|0|1|future") + "\n");
         return bytes;
     }
 
@@ -222,10 +230,10 @@ class DistributedCheckpointRecoveryIT {
     private Path writeFixture() throws IOException {
         Path fixture = temporaryDirectory.resolve("events.txt");
         Files.writeString(fixture, String.join("\n",
-                "member-alpha|book-1|first|SEARCH|18000",
+                "member-beta|book-1|first|SEARCH|18000",
                 "bot-crawler|book-x|ignored|SEARCH|19000",
-                "member-alpha|book-1|second|RESULT_CLICK|20000",
-                "member-alpha|book-2|future|SEARCH|2000000") + "\n");
+                "member-beta|book-1|second|RESULT_CLICK|20000",
+                "member-beta|book-2|future|SEARCH|2000000") + "\n");
         return fixture;
     }
 

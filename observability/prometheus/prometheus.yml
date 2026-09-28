@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: engine-master
+    static_configs:
+      - targets: ["master:8080"]
+        labels:
+          component: master
+
+  - job_name: engine-workers
+    static_configs:
+      - targets: ["worker1:8081", "worker2:8081", "worker3:8081"]
+        labels:
+          component: worker

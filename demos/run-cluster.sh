@@ -75,6 +75,7 @@ echo "starting master on :7000"
 # The master needs the job's classes too: it deserializes the submitted graph in order to
 # compile it, and that graph holds the user's own operators.
 MASTER_PORT=7000 ETCD_ENDPOINTS=http://localhost:2379 \
+  MASTER_STATUS_PORT="${MASTER_STATUS_PORT:-18080}" \
   CHECKPOINT_INTERVAL_MS="${CHECKPOINT_INTERVAL_MS:-10000}" \
   CHECKPOINT_TIMEOUT_MS="${CHECKPOINT_TIMEOUT_MS:-30000}" \
   RESTART_MAX_ATTEMPTS="${RESTART_MAX_ATTEMPTS:-3}" \
@@ -94,6 +95,7 @@ for i in 1 2 3; do
   WORKER_RPC_PORT=$rpc \
   WORKER_DATA_PORT=$data \
   WORKER_SLOTS="${WORKER_SLOTS:-12}" \
+  WORKER_METRICS_PORT=$((18080 + i)) \
   MASTER_HOST=localhost \
   MASTER_PORT=7000 \
   ETCD_ENDPOINTS=http://localhost:2379 \

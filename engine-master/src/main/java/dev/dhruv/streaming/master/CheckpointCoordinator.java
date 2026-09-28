@@ -7,6 +7,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -30,6 +31,16 @@ import java.util.concurrent.ThreadFactory;
  * of old and new task state.
  */
 public final class CheckpointCoordinator implements AutoCloseable {
+
+    /** In-memory operational counters; durable recovery remains the latest completed pointer. */
+    public record Status(long intervalMillis, long completed, long failed,
+                         List<Completed> history) {
+    }
+
+    /** Aggregate facts from one fully acknowledged checkpoint. */
+    public record Completed(long id, long durationMs, long stateBytes, long alignmentMs,
+                            long completedAt) {
+    }
 
     /** Checkpoint cadence and the maximum time an in-flight barrier may take. */
     public record Config(Duration interval, Duration timeout) {
@@ -103,9 +114,9 @@ public final class CheckpointCoordinator implements AutoCloseable {
             throw new IllegalArgumentException("cannot checkpoint a job with no tasks");
         }
         stop(jobId);
+        Optional<CompletedCheckpoint> previous = metadata.getLatestCompletedCheckpoint(jobId);
         JobCheckpoints job = new JobCheckpoints(Set.copyOf(tasks), actions,
-                metadata.getLatestCompletedCheckpoint(jobId)
-                        .map(CompletedCheckpoint::checkpointId).orElse(0L));
+                previous.map(CompletedCheckpoint::checkpointId).orElse(0L));
         jobs.put(jobId, job);
         job.periodic = scheduler.scheduleWithFixedDelay(
                 () -> trigger(jobId), config.interval().toMillis(), config.interval().toMillis(),
@@ -187,6 +198,7 @@ public final class CheckpointCoordinator implements AutoCloseable {
         }
         complete.timeout.cancel(false);
         job.inFlight = null;
+        job.recordCompleted(complete, clock.millis());
         job.actions.notifySinks(jobId, complete.id);
     }
 
@@ -194,6 +206,20 @@ public final class CheckpointCoordinator implements AutoCloseable {
     public synchronized Optional<Long> inFlightCheckpoint(String jobId) {
         JobCheckpoints job = jobs.get(jobId);
         return job == null || job.inFlight == null ? Optional.empty() : Optional.of(job.inFlight.id);
+    }
+
+    /** Configured interval shared by every job this coordinator owns. */
+    public long intervalMillis() {
+        return config.interval().toMillis();
+    }
+
+    /** Returns counters known by this coordinator instance without inventing durable history. */
+    public synchronized Status status(String jobId) {
+        JobCheckpoints job = jobs.get(jobId);
+        if (job == null) {
+            return new Status(config.interval().toMillis(), 0, 0, List.of());
+        }
+        return new Status(config.interval().toMillis(), job.completed, job.failed, List.copyOf(job.history));
     }
 
     private synchronized void timeout(String jobId, long checkpointId) {
@@ -211,6 +237,7 @@ public final class CheckpointCoordinator implements AutoCloseable {
         }
         checkpoint.timeout.cancel(false);
         job.inFlight = null;
+        job.failed++;
         job.actions.checkpointAborted(jobId, checkpoint.id, reason);
     }
 
@@ -235,11 +262,27 @@ public final class CheckpointCoordinator implements AutoCloseable {
         private long lastCheckpointId;
         private ScheduledFuture<?> periodic;
         private InFlight inFlight;
+        private long completed;
+        private long failed;
+        private final java.util.ArrayDeque<Completed> history = new java.util.ArrayDeque<>();
 
         private JobCheckpoints(Set<TaskKey> tasks, Actions actions, long lastCheckpointId) {
             this.tasks = tasks;
             this.actions = actions;
             this.lastCheckpointId = lastCheckpointId;
+        }
+
+        private void recordCompleted(InFlight checkpoint, long completedAt) {
+            completed++;
+            long stateBytes = checkpoint.acks.values().stream()
+                    .mapToLong(CompletedCheckpoint.TaskState::stateSizeBytes).sum();
+            long alignmentMs = checkpoint.acks.values().stream()
+                    .mapToLong(CompletedCheckpoint.TaskState::alignmentMillis).max().orElse(0);
+            history.addLast(new Completed(checkpoint.id, Math.max(0, completedAt - checkpoint.triggerTimestamp),
+                    stateBytes, alignmentMs, completedAt));
+            while (history.size() > 20) {
+                history.removeFirst();
+            }
         }
     }
 

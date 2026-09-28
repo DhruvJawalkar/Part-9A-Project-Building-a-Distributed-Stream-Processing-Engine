@@ -17,7 +17,6 @@ import org.rocksdb.RocksIterator;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.net.URI;
@@ -369,7 +368,8 @@ public final class RocksDbStateBackend implements StateBackend {
     }
 
     private static Object fromBytes(byte[] bytes) throws IOException {
-        try (ObjectInputStream input = new UserCodeObjectInputStream(new ByteArrayInputStream(bytes))) {
+        try (UserCodeObjectInputStream input =
+                     new UserCodeObjectInputStream(new ByteArrayInputStream(bytes))) {
             return input.readObject();
         } catch (ClassNotFoundException e) {
             throw new IOException("could not load a class stored in RocksDB state", e);
@@ -497,22 +497,6 @@ public final class RocksDbStateBackend implements StateBackend {
             }
             Files.delete(directory);
             return FileVisitResult.CONTINUE;
-        }
-    }
-
-    private static final class UserCodeObjectInputStream extends ObjectInputStream {
-        private UserCodeObjectInputStream(ByteArrayInputStream input) throws IOException {
-            super(input);
-        }
-
-        @Override
-        protected Class<?> resolveClass(java.io.ObjectStreamClass description)
-                throws IOException, ClassNotFoundException {
-            try {
-                return Class.forName(description.getName(), false, UserCodeClassLoader.get());
-            } catch (ClassNotFoundException ignored) {
-                return super.resolveClass(description);
-            }
         }
     }
 

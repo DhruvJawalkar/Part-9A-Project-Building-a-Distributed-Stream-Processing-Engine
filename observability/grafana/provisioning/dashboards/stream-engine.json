@@ -1,0 +1,59 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Source lag",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "stream-engine-prometheus"},
+      "targets": [{"refId": "A", "expr": "stream_engine_source_lag_records", "legendFormat": "{{operator}} / subtask {{subtask}} / {{worker}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Checkpoint duration and alignment",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "stream-engine-prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "stream_engine_checkpoint_duration_milliseconds", "legendFormat": "duration {{operator}}/{{subtask}}"},
+        {"refId": "B", "expr": "stream_engine_checkpoint_alignment_milliseconds", "legendFormat": "alignment {{operator}}/{{subtask}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "Records in by subtask",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "stream-engine-prometheus"},
+      "targets": [{"refId": "A", "expr": "rate(stream_engine_records_in_total[5m])", "legendFormat": "{{operator}} / subtask {{subtask}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "id": 4,
+      "title": "State size by subtask",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "stream-engine-prometheus"},
+      "targets": [{"refId": "A", "expr": "stream_engine_state_size_bytes", "legendFormat": "{{operator}} / subtask {{subtask}}"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["stream-processing", "phase-7"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Distributed Stream Processing Engine",
+  "uid": "stream-engine",
+  "version": 1
+}

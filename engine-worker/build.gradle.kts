@@ -12,6 +12,8 @@ dependencies {
     implementation(libs.minio)
 
     implementation(libs.slf4j.api)
+    implementation(libs.micrometer.core)
+    implementation(libs.micrometer.prometheus)
     runtimeOnly(libs.logback)
 
     testImplementation(libs.testcontainers)

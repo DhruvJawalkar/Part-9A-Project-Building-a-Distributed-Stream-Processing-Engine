@@ -5,6 +5,7 @@ import dev.dhruv.streaming.rpc.MasterServiceGrpc;
 import dev.dhruv.streaming.rpc.TaskId;
 import dev.dhruv.streaming.rpc.TaskState;
 import dev.dhruv.streaming.rpc.TaskStatus;
+import dev.dhruv.streaming.rpc.SourcePartitionLag;
 import dev.dhruv.streaming.rpc.WorkerBeat;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
@@ -124,7 +125,7 @@ final class HeartbeatClient implements AutoCloseable {
             long totalRecords = 0;
             for (RunningTask task : taskManager.runningTasks().values()) {
                 totalRecords += task.recordsIn();
-                builder.addTasks(TaskStatus.newBuilder()
+                TaskStatus.Builder status = TaskStatus.newBuilder()
                         .setTaskId(TaskId.newBuilder()
                                 .setJobId(task.jobId())
                                 .setOperatorId(task.operatorId())
@@ -137,7 +138,16 @@ final class HeartbeatClient implements AutoCloseable {
                         .setLastCheckpointDurationMillis(task.lastCheckpointDurationMillis())
                         .setLastCheckpointStateBytes(task.lastCheckpointStateBytes())
                         .setLastAlignmentMillis(task.lastAlignmentMillis())
-                        .build());
+                        .setBackpressured(task.isBackpressured())
+                        .setInputQueuedElements(task.inputQueuedElements())
+                        .setInputCapacity(task.inputCapacity());
+                task.sourceLag().ifPresent(lag -> {
+                    status.setSourceLagAvailable(true);
+                    lag.partitions().forEach(partition -> status.addSourceLag(SourcePartitionLag.newBuilder()
+                            .setTopic(partition.topic()).setPartition(partition.partition())
+                            .setLagRecords(partition.lagRecords())));
+                });
+                builder.addTasks(status.build());
             }
 
             builder.setRecordsProcessed(totalRecords);

@@ -4,13 +4,13 @@ import dev.dhruv.streaming.api.CheckpointBarrier;
 import dev.dhruv.streaming.api.StreamElement;
 import dev.dhruv.streaming.api.StreamRecord;
 import dev.dhruv.streaming.api.Watermark;
+import dev.dhruv.streaming.runtime.UserCodeObjectInputStream;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.util.ArrayList;
 import java.util.List;
@@ -142,18 +142,8 @@ public final class StreamElementSerializer {
     private static Object deserializeValue(byte[] value) throws IOException {
         // Records off the wire are user classes too, so they resolve the same way a deployed
         // operator does -- through the user-code loader rather than the engine's.
-        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(value)) {
-            @Override
-            protected Class<?> resolveClass(java.io.ObjectStreamClass description)
-                    throws IOException, ClassNotFoundException {
-                try {
-                    return Class.forName(description.getName(), false,
-                            dev.dhruv.streaming.runtime.UserCodeClassLoader.get());
-                } catch (ClassNotFoundException e) {
-                    return super.resolveClass(description);
-                }
-            }
-        }) {
+        try (UserCodeObjectInputStream in =
+                     new UserCodeObjectInputStream(new ByteArrayInputStream(value))) {
             return in.readObject();
         } catch (ClassNotFoundException e) {
             throw new IOException(
