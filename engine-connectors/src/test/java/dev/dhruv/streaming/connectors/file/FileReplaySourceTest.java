@@ -69,6 +69,34 @@ class FileReplaySourceTest {
         source.close();
     }
 
+    @Test
+    void restoresThePhysicalFixtureCursorFromItsCheckpoint() throws Exception {
+        Path fixture = writeFixture("""
+                {"id":"a","eventTimeMillis":10}
+                {"id":"b","eventTimeMillis":20}
+                {"id":"c","eventTimeMillis":30}
+                """);
+        Path checkpointDirectory = temporaryDirectory.resolve("checkpoint");
+        FileReplaySource<TestEvent> beforeFailure = FileReplaySource.of(fixture, TestEvent.class);
+        List<TestEvent> before = new ArrayList<>();
+        beforeFailure.open(new TestSourceContext(0, 1));
+        assertThat(beforeFailure.poll(collectorFor(before))).isTrue();
+        var handle = beforeFailure.snapshot(4, checkpointDirectory);
+        beforeFailure.close();
+
+        FileReplaySource<TestEvent> recovered = FileReplaySource.of(fixture, TestEvent.class);
+        List<TestEvent> after = new ArrayList<>();
+        recovered.open(new TestSourceContext(0, 1));
+        recovered.restore(handle);
+        while (recovered.poll(collectorFor(after))) {
+            // Drain the suffix after the saved physical line cursor.
+        }
+        recovered.close();
+
+        assertThat(before).containsExactly(new TestEvent("a", 10));
+        assertThat(after).containsExactly(new TestEvent("b", 20), new TestEvent("c", 30));
+    }
+
     private Path writeFixture(String contents) throws IOException {
         Path fixture = temporaryDirectory.resolve("events.jsonl");
         Files.writeString(fixture, contents);

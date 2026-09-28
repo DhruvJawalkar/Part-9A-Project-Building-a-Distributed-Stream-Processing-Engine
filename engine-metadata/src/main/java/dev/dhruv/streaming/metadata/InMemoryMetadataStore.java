@@ -29,6 +29,7 @@ public final class InMemoryMetadataStore implements MetadataStore {
     private final Map<String, JobState> states = new ConcurrentHashMap<>();
     private final Map<String, String> causes = new ConcurrentHashMap<>();
     private final Map<String, Map<String, String>> assignments = new ConcurrentHashMap<>();
+    private final Map<String, CompletedCheckpoint> checkpoints = new ConcurrentHashMap<>();
     private final Map<String, RegisteredWorker> workers = new ConcurrentHashMap<>();
     private final List<Consumer<List<RegisteredWorker>>> watchers = new CopyOnWriteArrayList<>();
 
@@ -70,6 +71,16 @@ public final class InMemoryMetadataStore implements MetadataStore {
     @Override
     public Map<String, String> getAssignments(String jobId) {
         return assignments.getOrDefault(jobId, Map.of());
+    }
+
+    @Override
+    public void putLatestCompletedCheckpoint(String jobId, CompletedCheckpoint checkpoint) {
+        checkpoints.put(jobId, checkpoint);
+    }
+
+    @Override
+    public Optional<CompletedCheckpoint> getLatestCompletedCheckpoint(String jobId) {
+        return Optional.ofNullable(checkpoints.get(jobId));
     }
 
     @Override

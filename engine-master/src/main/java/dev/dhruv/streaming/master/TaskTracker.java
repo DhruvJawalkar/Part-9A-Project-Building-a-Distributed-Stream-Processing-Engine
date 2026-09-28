@@ -95,6 +95,9 @@ public final class TaskTracker implements AutoCloseable {
      */
     public void heartbeatReceived(String workerId) {
         lastBeatNanos.put(workerId, System.nanoTime());
+        // A master restart rebuilds this in-memory table from the first beat sent by each
+        // surviving worker. Its durable address is loaded independently from etcd.
+        health.put(workerId, WorkerHealth.ALIVE);
     }
 
     /**

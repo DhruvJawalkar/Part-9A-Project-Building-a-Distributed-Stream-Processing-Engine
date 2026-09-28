@@ -123,6 +123,14 @@ final class RemoteSubpartition implements ResultSubpartition {
                             + CREDIT_TIMEOUT_SECONDS + "s; the downstream task is stuck or gone");
         }
 
+        // close() releases one permit specifically to wake a sender whose downstream worker
+        // disappeared. That permit is cancellation, not permission to put another buffer on a
+        // stream which is being torn down.
+        if (closed) {
+            pending.clear();
+            return;
+        }
+
         try {
             byte[] payload = StreamElementSerializer.serialize(pending);
             outbound.onNext(DataBuffer.newBuilder()
@@ -140,15 +148,24 @@ final class RemoteSubpartition implements ResultSubpartition {
     }
 
     @Override
-    public synchronized void close() {
+    public void close() {
         if (closed) {
             return;
         }
         closed = true;
-        try {
-            outbound.onCompleted();
-        } catch (RuntimeException e) {
-            log.debug("closing the stream to subtask {} failed", targetSubtask, e);
+
+        // add()/flush() wait for credit while holding this object's monitor. Do not wait for
+        // that monitor before publishing cancellation: a dead downstream will never grant the
+        // credit which would otherwise let close acquire it. Waking the waiter and rechecking
+        // closed in ship() makes teardown bounded.
+        credit.release();
+        synchronized (this) {
+            pending.clear();
+            try {
+                outbound.onCompleted();
+            } catch (RuntimeException e) {
+                log.debug("closing the stream to subtask {} failed", targetSubtask, e);
+            }
         }
     }
 }

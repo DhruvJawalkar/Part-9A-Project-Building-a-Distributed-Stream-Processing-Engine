@@ -1,8 +1,8 @@
 # Distributed Stream Processing Engine
 
-A teaching implementation of a distributed stream processing engine in Java 21. It currently
-runs master and worker processes, routes records over gRPC, and processes keyed streams in event
-time; checkpointing and exactly-once Iceberg output are the next planned phases.
+A teaching implementation of a distributed stream processing engine in Java 21. It runs master
+and worker processes, routes records over gRPC, processes keyed streams in event time, and recovers
+the whole job from coordinated checkpoints. Transactional Iceberg output remains a later phase.
 
 It accompanies **Part 9A: Stream Processing Fundamentals** of the *Developing Intuition on
 Building Blocks — Systems Design* series. The article explains how an engine like this works;
@@ -34,7 +34,7 @@ implementation stops is part of understanding what production engines do for you
 | **1** | Single-process engine: Kafka → filter → console | **Complete** |
 | **2** | Master and worker processes, gRPC transport, etcd | **Complete** |
 | **3** | Event time, watermarks, keyed state, session windows | **Complete** |
-| 4 | Checkpointing, barrier alignment, recovery | Planned |
+| **4** | Checkpointing, barrier alignment, portable state, recovery | **Complete** |
 | 5 | The interval join | Planned |
 | 6 | Transactional Iceberg sink | Planned |
 | 7 | Status API and the four demos | Planned |
@@ -46,26 +46,17 @@ implementation stops is part of understanding what production engines do for you
 Requires **JDK 21+** and **Docker**.
 
 ```bash
-docker compose up -d          # Kafka (KRaft), topics created with 4 partitions
+docker compose up -d          # Kafka, etcd and MinIO; topics are created with 4 partitions
+./demos/run-cluster.sh        # master on :7000 and three workers on :7001-7003
 ./demos/seed-clicks.sh        # publish the click fixture
-./gradlew :lms-job:run        # run the job; Ctrl-C to stop
+./gradlew :lms-job:submitToCluster
+./demos/run-cluster.sh stop
 ```
 
-The job now prints `SessionRow` values, rather than one line per click. A row appears when the
-event-time watermark reaches the session end (15 minutes after the latest event for that member).
-That delay is deliberate: it is the proof that the job is using when an event happened, not when
-the process happened to receive it.
-
-To watch offsets being committed and resumed:
-
-```bash
-./gradlew :lms-job:run        # run once, let it consume, Ctrl-C
-./gradlew :lms-job:run        # run again: Kafka resumes from its committed offset
-./demos/seed-clicks.sh        # publish more
-./gradlew :lms-job:run        # observe rows for the new event-time sessions
-```
-
-Run the full test suite with `./gradlew test`. The focused Phase 3 proof is:
+The job prints `SessionRow` values when the event-time watermark reaches the session end. Kafka
+partition positions are owned by the engine: the next offset is captured in each source
+checkpoint, and recovery seeks to that offset without relying on broker-committed consumer-group
+positions. Run the full unit suite with `./gradlew test`. The focused Phase 3 proof is:
 
 ```bash
 ./gradlew :engine-runtime:test :lms-job:test :engine-connectors:test
@@ -73,7 +64,10 @@ Run the full test suite with `./gradlew test`. The focused Phase 3 proof is:
 
 It covers bounded out-of-orderness, the silent-partition/idleness regression, keyed routing and
 state, timer key restoration, session extension, stale-timer suppression, state clearing, and
-deterministic file replay. Tear everything down with `docker compose down -v`.
+deterministic file replay. Phase 4 checkpoint unit, integration, and recovery acceptance tests
+run through Gradle; the Docker-backed MinIO check is
+`./gradlew :engine-worker:integrationTest`. Tear everything down with
+`docker compose down -v`.
 
 ### A note on output ordering
 
@@ -253,6 +247,66 @@ timer service. This keeps scope obvious until state names are namespaced per ope
 
 ---
 
+## What Phase 4 built
+
+Phase 4 gives the engine a consistent recovery point across source positions, keyed state, timers,
+and every task in the computation DAG. The default checkpoint interval is 10 seconds, with a
+30-second timeout; the fixed-delay restart policy allows three attempts, one second apart.
+The cluster launcher accepts `CHECKPOINT_INTERVAL_MS`, `CHECKPOINT_TIMEOUT_MS`,
+`RESTART_MAX_ATTEMPTS`, and `RESTART_DELAY_MS` as environment overrides.
+
+- **Coordinator and protocol** — `CheckpointCoordinator` injects barriers at source tasks only,
+  accepts one acknowledgement per physical task, and publishes a completed checkpoint pointer to
+  etcd only after every task has acknowledged. It then sends the completion notification. Timed-out
+  checkpoints are aborted, and workers release channels held by incomplete alignments.
+- **Barrier alignment** — a multi-input task blocks each channel after its barrier arrives, while
+  continuing to read channels that have not reached the same barrier. It snapshots only after all
+  inputs have arrived, forwards the barrier, acknowledges, and then releases buffered post-barrier
+  records. Single-input tasks take the direct path without blocking their only input.
+- **Recoverable state** — `RocksDbStateBackend` stores keyed value and list state, with pending
+  event-time timers and watermark progress captured in the task checkpoint envelope. Source
+  snapshots include Kafka topic-partition offsets and source watermark-generator progress; Kafka
+  offsets are restored with `seek()` and are not committed as the recovery position.
+- **Portable checkpoint archives** — each task stages a local snapshot, archives its complete
+  checkpoint directory, and publishes the archive to MinIO. etcd stores task handles only for a
+  fully completed checkpoint. Nested paths are relative to the archive, so recovery can download
+  and restore on a different worker filesystem. A filesystem-backed archive store is available
+  for local tests.
+- **Whole-job recovery** — on worker loss, the master cancels every task, loads the latest completed
+  checkpoint from etcd, and redeploys the full DAG with each task's state handle. A worker declared
+  dead is quarantined from scheduling until it registers afresh. The job moves through
+  `FAILING → RESTARTING → RUNNING`, or becomes `FAILED` when no checkpoint exists or attempts are
+  exhausted.
+- **Checkpoint metrics** — acknowledgements and worker heartbeats carry checkpoint id, snapshot
+  duration, state size in bytes, and barrier-alignment time per task. The master retains the
+  latest sample for the Phase 7 status API.
+- **Lifecycle continuity** — workers reconnect their heartbeat streams after a master restart,
+  and bounded jobs become `FINISHED` only after every physical task has ended.
+
+### Phase 4 recovery evidence
+
+`DistributedCheckpointRecoveryIT` is the automated process-level proof; run it with
+`./gradlew :lms-job:integrationTest`. Testcontainers provides etcd and MinIO, and the test launches
+a real master and three worker child JVMs. Its five-task bounded job completes a checkpoint while
+the sink has emitted zero bytes. The test force-kills the session owner selected by
+`KeyGroupAssigner`, verifies that recovery reassigns its work without the dead worker, and waits
+for the job to reach `FINISHED`. Its output is byte-identical to a clean baseline run.
+
+The separate manual three-worker run scheduled 10 tasks. Checkpoints 1–5 completed with 10 task
+handles each published to MinIO and recorded in etcd. After worker-2 was force-killed, the
+heartbeat detector declared it dead after three missed beats (about 3.47 seconds); the master
+recorded the three lost tasks (`clicks:1`, `sessions:0`, `sessions:3`), cancelled the whole job,
+and restarted attempt 1/3
+from checkpoint 5 on worker-1 and worker-3. The recovered assignments excluded worker-2, and
+checkpoints 6 onward again completed with all 10 handles. The handles used `minio://` URIs and
+included source-position and operator-state envelopes.
+
+The focused `SessionPipelineRecoveryAcceptanceTest` also compares recovered source/session/sink
+execution with a clean fixed replay. The MinIO integration test restores an archive after deleting
+the producer's local checkpoint directory.
+
+---
+
 ## Known limitations
 
 Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
@@ -261,18 +315,17 @@ Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
 |---|---|---|
 | Master is a single point of failure | Leader election is Part 6 material; Flink has the same property without HA configured | etcd already holds the metadata — add a lease-based election and a standby master |
 | No dynamic rescaling | Parallelism is fixed at submission. Key groups are implemented, so the hard part is done | Add a savepoint command, restore at a different parallelism, let `KeyGroupAssigner` redistribute |
-| No savepoints | Checkpointing itself is planned for Phase 4; savepoints come after it with a retention policy and stable operator ids | `POST /jobs/{id}/savepoint` and a `--fromSavepoint` flag |
-| No checkpointing yet | Phase 4 introduces aligned checkpoints because the mechanism is the lesson | Later persist in-flight buffered records for unaligned checkpoints |
+| No savepoints | Phase 4 checkpoints are recovery points managed by the running job, without user-triggered retention or restore selection | `POST /jobs/{id}/savepoint` and a `--fromSavepoint` flag |
+| No unaligned checkpoints | Phase 4 uses aligned barriers and buffers post-barrier records on blocked channels | Persist in-flight channel buffers for unaligned checkpoints |
 | No SQL or higher-level API | Framework DSLs are Parts 9B and 9C | A minimal SQL parser producing a `JobGraph` |
 | No security, multi-tenancy or resource isolation | Orthogonal to every mechanism being taught | — |
 
-Additionally, as of Phase 3: state is heap-backed and is not yet included in a coordinated job
-checkpoint. A worker death still fails the job outright; there is no consistent whole-job point
-to rewind to until planned Phase 4. Kafka offsets remain broker-managed, so the end-to-end
-delivery guarantee is at-least-once rather than exactly-once. `FileReplaySource` is bounded and
-deterministic, but the Phase 7 runnable demos have not been added. Job classes reach master and
-workers through a `JOB_CLASSPATH` set at startup rather than being shipped with submission, so
-every process needs the same classpath and changing the job means restarting them.
+Additionally, Phase 4 recovery is at-least-once at the whole-job boundary: the console sink has no
+transactional commit protocol, and exactly-once external output is not claimed until Phase 6's
+Iceberg sink. `FileReplaySource` is bounded and deterministic, but the Phase 7 runnable demos have
+not been added. Job classes reach master and workers through a `JOB_CLASSPATH` set at startup
+rather than being shipped with submission, so every process needs the same classpath and changing
+the job means restarting them.
 
 ---
 

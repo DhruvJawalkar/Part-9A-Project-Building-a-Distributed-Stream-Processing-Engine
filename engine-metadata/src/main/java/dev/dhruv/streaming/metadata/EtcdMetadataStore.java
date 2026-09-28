@@ -13,6 +13,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -114,6 +119,20 @@ public final class EtcdMetadataStore implements MetadataStore {
                 .orElseGet(Map::of);
     }
 
+    @Override
+    public void putLatestCompletedCheckpoint(String jobId, CompletedCheckpoint checkpoint) {
+        put(jobKey(jobId, "checkpoints/latest"), ByteSequence.from(encodeCheckpoint(checkpoint)));
+        log.info("job {} completed checkpoint {} with {} task handle(s)", jobId,
+                checkpoint.checkpointId(), checkpoint.taskStates().size());
+    }
+
+    @Override
+    public Optional<CompletedCheckpoint> getLatestCompletedCheckpoint(String jobId) {
+        return get(jobKey(jobId, "checkpoints/latest"))
+                .map(ByteSequence::getBytes)
+                .map(EtcdMetadataStore::decodeCheckpoint);
+    }
+
     private static Map<String, String> decodeAssignments(String encoded) {
         Map<String, String> assignments = new LinkedHashMap<>();
         for (String line : encoded.split("\n")) {
@@ -124,6 +143,61 @@ public final class EtcdMetadataStore implements MetadataStore {
             assignments.put(line.substring(0, split), line.substring(split + 1));
         }
         return assignments;
+    }
+
+    /*
+     * A compact binary value rather than Java serialization or a JSON library. Metadata is an
+     * engine boundary, not a place where a change to a user operator's serial form should make a
+     * job unrecoverable. The order is explicit too, so inspecting the bytes is deterministic.
+     */
+    private static byte[] encodeCheckpoint(CompletedCheckpoint checkpoint) {
+        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+             DataOutputStream out = new DataOutputStream(bytes)) {
+            out.writeLong(checkpoint.checkpointId());
+            out.writeLong(checkpoint.triggerTimestamp());
+            out.writeInt(checkpoint.taskStates().size());
+            checkpoint.taskStates().entrySet().stream().sorted(Map.Entry.comparingByKey())
+                    .forEach(entry -> writeCheckpointTask(out, entry));
+            out.flush();
+            return bytes.toByteArray();
+        } catch (IOException e) {
+            throw new MetadataStoreException("could not encode completed checkpoint", e);
+        }
+    }
+
+    private static void writeCheckpointTask(DataOutputStream out,
+                                            Map.Entry<String, CompletedCheckpoint.TaskState> entry) {
+        try {
+            out.writeUTF(entry.getKey());
+            out.writeUTF(entry.getValue().stateHandleUri());
+            out.writeLong(entry.getValue().stateSizeBytes());
+            out.writeLong(entry.getValue().alignmentMillis());
+        } catch (IOException e) {
+            throw new MetadataStoreException("could not encode checkpoint task", e);
+        }
+    }
+
+    private static CompletedCheckpoint decodeCheckpoint(byte[] encoded) {
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(encoded))) {
+            long checkpointId = in.readLong();
+            long triggerTimestamp = in.readLong();
+            int count = in.readInt();
+            if (count < 1) {
+                throw new IllegalArgumentException("completed checkpoint had no task states");
+            }
+            Map<String, CompletedCheckpoint.TaskState> tasks = new LinkedHashMap<>();
+            for (int index = 0; index < count; index++) {
+                String taskId = in.readUTF();
+                tasks.put(taskId, new CompletedCheckpoint.TaskState(
+                        in.readUTF(), in.readLong(), in.readLong()));
+            }
+            if (in.available() != 0) {
+                throw new IllegalArgumentException("completed checkpoint has trailing bytes");
+            }
+            return new CompletedCheckpoint(checkpointId, triggerTimestamp, tasks);
+        } catch (IOException e) {
+            throw new MetadataStoreException("could not decode completed checkpoint", e);
+        }
     }
 
     @Override

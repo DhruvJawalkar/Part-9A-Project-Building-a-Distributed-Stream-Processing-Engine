@@ -85,4 +85,29 @@ public final class BoundedOutOfOrdernessGenerator {
     public boolean isIdle() {
         return idle;
     }
+
+    /**
+     * Captures the event-time progress needed to resume a source after a checkpoint.
+     *
+     * <p>A source offset by itself is not enough: a restored session operator may have timers
+     * beyond every replayed record, so its restored source must retain the greatest event time
+     * already seen in order to advance the same watermark again.
+     */
+    public Snapshot snapshot() {
+        return new Snapshot(maxEventTime, observedEvent, lastActivityWallClock, idle);
+    }
+
+    /** Restores event-time and idleness progress from {@link #snapshot()}. */
+    public void restore(Snapshot snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        maxEventTime = snapshot.maxEventTime();
+        observedEvent = snapshot.observedEvent();
+        lastActivityWallClock = snapshot.lastActivityWallClock();
+        idle = snapshot.idle();
+    }
+
+    /** Serializable source watermark progress saved with a source checkpoint. */
+    public record Snapshot(long maxEventTime, boolean observedEvent, long lastActivityWallClock,
+                           boolean idle) {
+    }
 }

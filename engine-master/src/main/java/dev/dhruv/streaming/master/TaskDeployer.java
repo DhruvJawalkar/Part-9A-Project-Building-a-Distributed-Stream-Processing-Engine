@@ -5,6 +5,7 @@ import dev.dhruv.streaming.master.graph.ExecutionGraph;
 import dev.dhruv.streaming.metadata.RegisteredWorker;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * How the master actually gets tasks onto workers.
@@ -17,6 +18,15 @@ import java.util.List;
 public interface TaskDeployer {
 
     /**
+     * Refreshes the deployer's address book after a master restart.
+     *
+     * <p>No task is deployed by this call. It only lets a recovered coordinator address the
+     * workers that already host a still-running job.
+     */
+    default void observeWorkers(List<RegisteredWorker> workers) {
+    }
+
+    /**
      * Sends every task of a compiled plan to the worker that owns it.
      *
      * @param graph   the logical graph, whose operators are serialized into the deployments
@@ -24,6 +34,37 @@ public interface TaskDeployer {
      * @param workers the workers it was compiled against, for their addresses
      */
     void deploy(JobGraph graph, ExecutionGraph plan, List<RegisteredWorker> workers);
+
+    /**
+     * Redeploys every vertical slice from one completed checkpoint.
+     *
+     * <p>The default keeps old test deployers small. A real deployer overrides it and places
+     * each opaque state handle in the corresponding {@code TaskDeployment} before the task is
+     * allowed to process anything.
+     *
+     * @param stateHandles {@code operatorId:subtaskIndex} to opaque state-backend URI
+     */
+    default void deployFromCheckpoint(JobGraph graph,
+                                      ExecutionGraph plan,
+                                      List<RegisteredWorker> workers,
+                                      Map<String, String> stateHandles) {
+        deploy(graph, plan, workers);
+    }
+
+    /** Injects a barrier at source tasks only; all other tasks receive it through their input. */
+    default void triggerSources(JobGraph graph, ExecutionGraph plan,
+                                long checkpointId, long triggerTimestamp) {
+        throw new UnsupportedOperationException("checkpoint triggering is not configured");
+    }
+
+    /** Announces a completed checkpoint to sink tasks only. */
+    default void notifySinks(JobGraph graph, ExecutionGraph plan, long checkpointId) {
+        throw new UnsupportedOperationException("checkpoint completion is not configured");
+    }
+
+    /** Releases task inputs blocked while aligning an incomplete checkpoint. */
+    default void abortCheckpoint(JobGraph graph, ExecutionGraph plan, long checkpointId) {
+    }
 
     /**
      * Cancels every task of a job.

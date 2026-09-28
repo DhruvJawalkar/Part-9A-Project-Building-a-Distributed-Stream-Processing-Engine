@@ -2,15 +2,20 @@ package dev.dhruv.streaming.connectors.file;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.dhruv.streaming.api.CheckpointableSource;
 import dev.dhruv.streaming.api.Collector;
-import dev.dhruv.streaming.api.Source;
 import dev.dhruv.streaming.api.SourceContext;
+import dev.dhruv.streaming.api.state.StateHandle;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.Properties;
 
 /**
  * A bounded JSON Lines source used by deterministic demos and tests.
@@ -20,6 +25,8 @@ import java.util.Objects;
  * it makes the partitioning rule visible and means a fixture has one canonical ordering. The
  * source emits one accepted record per poll: replay is driven by the task loop, never by wall
  * clock sleeps, so the input itself remains reproducible.
+ * Its checkpoint is the physical line cursor, including lines belonging to other subtasks, so a
+ * recovered subtask resumes the exact same deterministic suffix.
  *
  * <p>Unlike {@code KafkaSource}, malformed input fails the source. A replay fixture is part of
  * a test or a demonstration; silently dropping a malformed line would make the claimed result
@@ -27,7 +34,7 @@ import java.util.Objects;
  *
  * @param <T> record type decoded from each JSON line
  */
-public final class FileReplaySource<T> implements Source<T> {
+public final class FileReplaySource<T> implements CheckpointableSource<T> {
 
     private static final long serialVersionUID = 1L;
 
@@ -101,6 +108,52 @@ public final class FileReplaySource<T> implements Source<T> {
     }
 
     @Override
+    public StateHandle snapshot(long checkpointId, Path checkpointDir) throws IOException {
+        requireOpen();
+        Files.createDirectories(checkpointDir);
+        Path snapshot = checkpointDir.resolve("file-replay-" + checkpointId + ".properties");
+        Properties state = new Properties();
+        state.setProperty("file", fileName);
+        state.setProperty("subtask", Integer.toString(subtaskIndex));
+        state.setProperty("parallelism", Integer.toString(parallelism));
+        // This is the physical fixture cursor, not the number of records this subtask emitted:
+        // a subtask also consumes lines assigned to its siblings while it looks for its own.
+        state.setProperty("line-number", Long.toString(lineNumber));
+        try (Writer writer = Files.newBufferedWriter(snapshot)) {
+            state.store(writer, "File replay cursor; written before checkpoint barrier");
+        }
+        return new StateHandle(snapshot.toAbsolutePath().toUri(), Files.size(snapshot));
+    }
+
+    @Override
+    public void restore(StateHandle handle) throws IOException {
+        requireOpen();
+        Properties state = new Properties();
+        try (Reader reader = Files.newBufferedReader(pathFor(handle.uri()))) {
+            state.load(reader);
+        }
+        if (!fileName.equals(state.getProperty("file"))
+                || subtaskIndex != parseInt(state, "subtask")
+                || parallelism != parseInt(state, "parallelism")) {
+            throw new IOException("file replay checkpoint belongs to a different source partition");
+        }
+        long cursor = parseLong(state, "line-number");
+        if (cursor < 0) {
+            throw new IOException("file replay checkpoint line number must not be negative");
+        }
+        reader.close();
+        reader = Files.newBufferedReader(Path.of(fileName));
+        lineNumber = 0;
+        while (lineNumber < cursor) {
+            if (reader.readLine() == null) {
+                throw new IOException("file replay checkpoint cursor " + cursor
+                        + " is past the end of fixture '" + fileName + "'");
+            }
+            lineNumber++;
+        }
+    }
+
+    @Override
     public void close() throws IOException {
         if (reader != null) {
             reader.close();
@@ -115,6 +168,33 @@ public final class FileReplaySource<T> implements Source<T> {
     private void requireOpen() {
         if (reader == null || mapper == null) {
             throw new IllegalStateException("FileReplaySource must be opened before polling");
+        }
+    }
+
+    private static int parseInt(Properties state, String key) throws IOException {
+        try {
+            return Integer.parseInt(Objects.requireNonNull(state.getProperty(key), "missing " + key));
+        } catch (NumberFormatException | NullPointerException e) {
+            throw new IOException("invalid file replay checkpoint property '" + key + "'", e);
+        }
+    }
+
+    private static long parseLong(Properties state, String key) throws IOException {
+        try {
+            return Long.parseLong(Objects.requireNonNull(state.getProperty(key), "missing " + key));
+        } catch (NumberFormatException | NullPointerException e) {
+            throw new IOException("invalid file replay checkpoint property '" + key + "'", e);
+        }
+    }
+
+    private static Path pathFor(URI uri) throws IOException {
+        if (!"file".equalsIgnoreCase(uri.getScheme())) {
+            throw new IOException("file replay can only restore a file checkpoint handle: " + uri);
+        }
+        try {
+            return Path.of(uri);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("invalid file replay checkpoint handle: " + uri, e);
         }
     }
 }

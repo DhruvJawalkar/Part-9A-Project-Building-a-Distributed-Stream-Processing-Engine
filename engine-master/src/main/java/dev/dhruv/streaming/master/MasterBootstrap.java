@@ -13,6 +13,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -47,10 +48,19 @@ public final class MasterBootstrap implements AutoCloseable {
      * @param etcdEndpoints where durable job state lives
      */
     public MasterBootstrap(int port, String etcdEndpoints) {
+        this(port, etcdEndpoints, new CheckpointCoordinator.Config(Duration.ofSeconds(10),
+                Duration.ofSeconds(30)), RestartStrategy.fixedDelayDefault());
+    }
+
+    /** Creates a master with explicit operational checkpoint and restart settings. */
+    public MasterBootstrap(int port,
+                           String etcdEndpoints,
+                           CheckpointCoordinator.Config checkpointConfig,
+                           RestartStrategy restartStrategy) {
         this.port = port;
         this.metadata = new EtcdMetadataStore(etcdEndpoints);
         this.deployer = new GrpcTaskDeployer();
-        this.jobMaster = new JobMaster(metadata, deployer);
+        this.jobMaster = new JobMaster(metadata, deployer, checkpointConfig, restartStrategy);
         this.service = new MasterService(jobMaster, metadata);
     }
 
@@ -161,13 +171,22 @@ public final class MasterBootstrap implements AutoCloseable {
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(env("MASTER_PORT", "9090"));
         String etcd = env("ETCD_ENDPOINTS", "http://localhost:2379");
+        Duration checkpointInterval = Duration.ofMillis(Long.parseLong(
+                env("CHECKPOINT_INTERVAL_MS", "10000")));
+        Duration checkpointTimeout = Duration.ofMillis(Long.parseLong(
+                env("CHECKPOINT_TIMEOUT_MS", "30000")));
+        int restartAttempts = Integer.parseInt(env("RESTART_MAX_ATTEMPTS", "3"));
+        Duration restartDelay = Duration.ofMillis(Long.parseLong(
+                env("RESTART_DELAY_MS", "1000")));
 
         // The master deserializes the submitted JobGraph in order to compile it, and that graph
         // holds the user's own operators. So the master needs the job's classes exactly as every
         // worker does. Flink's JobManager has the same requirement, for the same reason.
         UserCodeClassLoader.configure(System.getenv("JOB_CLASSPATH"));
 
-        MasterBootstrap master = new MasterBootstrap(port, etcd);
+        MasterBootstrap master = new MasterBootstrap(port, etcd,
+                new CheckpointCoordinator.Config(checkpointInterval, checkpointTimeout),
+                new RestartStrategy(restartAttempts, restartDelay));
         Runtime.getRuntime().addShutdownHook(new Thread(master::close, "shutdown"));
         master.start();
         master.awaitTermination();

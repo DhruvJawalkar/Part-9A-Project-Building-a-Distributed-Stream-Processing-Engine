@@ -18,6 +18,8 @@ import dev.dhruv.streaming.rpc.OperatorKind;
 import dev.dhruv.streaming.rpc.OutputChannel;
 import dev.dhruv.streaming.rpc.TaskDeployment;
 import dev.dhruv.streaming.rpc.TaskId;
+import dev.dhruv.streaming.rpc.CheckpointId;
+import dev.dhruv.streaming.rpc.CheckpointTrigger;
 import dev.dhruv.streaming.rpc.WorkerServiceGrpc;
 import dev.dhruv.streaming.runtime.SerializationUtil;
 import io.grpc.ManagedChannel;
@@ -27,6 +29,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -57,49 +60,133 @@ public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
 
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private final Map<String, RegisteredWorker> workersById = new ConcurrentHashMap<>();
+    private final DeploymentRpc deploymentRpc;
+    private final CancellationRpc cancellationRpc;
+
+    public GrpcTaskDeployer() {
+        this(null, null);
+    }
+
+    /** Package-private transport seam for testing uncertain RPC outcomes without a real socket. */
+    GrpcTaskDeployer(DeploymentRpc deploymentRpc, CancellationRpc cancellationRpc) {
+        this.deploymentRpc = deploymentRpc == null
+                ? (worker, deployment) -> stubFor(worker)
+                        .withDeadlineAfter(30, TimeUnit.SECONDS)
+                        .deployTask(deployment)
+                : deploymentRpc;
+        this.cancellationRpc = cancellationRpc == null
+                ? (worker, task) -> stubFor(worker)
+                        .withDeadlineAfter(5, TimeUnit.SECONDS)
+                        .cancelTask(task)
+                : cancellationRpc;
+    }
+
+    @Override
+    public void observeWorkers(List<RegisteredWorker> workers) {
+        workers.forEach(worker -> workersById.put(worker.workerId(), worker));
+    }
 
     @Override
     public void deploy(JobGraph graph, ExecutionGraph plan, List<RegisteredWorker> workers) {
-        workers.forEach(worker -> workersById.put(worker.workerId(), worker));
+        deploy(graph, plan, workers, Map.of());
+    }
+
+    @Override
+    public void deployFromCheckpoint(JobGraph graph,
+                                     ExecutionGraph plan,
+                                     List<RegisteredWorker> workers,
+                                     Map<String, String> stateHandles) {
+        deploy(graph, plan, workers, stateHandles);
+    }
+
+    private void deploy(JobGraph graph,
+                        ExecutionGraph plan,
+                        List<RegisteredWorker> workers,
+                        Map<String, String> stateHandles) {
+        observeWorkers(workers);
+        List<DeployedTask> attempted = new ArrayList<>();
 
         // Reverse topological order. See the class comment: this is what stops a running source
         // from sending to a task that has not been created yet.
         List<ChainGroup> reversed = new ArrayList<>(plan.chainGroups());
         java.util.Collections.reverse(reversed);
 
-        for (ChainGroup chain : reversed) {
-            for (int subtask = 0; subtask < chain.parallelism(); subtask++) {
-                TaskAssignment assignment =
-                        plan.assignments().get(chain.id() + ":" + subtask);
-                RegisteredWorker worker = workersById.get(assignment.workerId());
+        try {
+            for (ChainGroup chain : reversed) {
+                for (int subtask = 0; subtask < chain.parallelism(); subtask++) {
+                    TaskAssignment assignment =
+                            plan.assignments().get(chain.id() + ":" + subtask);
+                    RegisteredWorker worker = workersById.get(assignment.workerId());
 
-                TaskDeployment deployment =
-                        buildDeployment(graph, plan, chain, subtask, worker);
+                    TaskDeployment deployment =
+                            buildDeployment(graph, plan, chain, subtask, worker, stateHandles);
 
-                DeployAck ack = stubFor(worker)
-                        .withDeadlineAfter(30, TimeUnit.SECONDS)
-                        .deployTask(deployment);
+                    // Once the request leaves the master its outcome is uncertain until proven
+                    // otherwise. A deadline can fire after the worker has already started the
+                    // task but before its ACK reaches us, so rollback must include this attempt.
+                    attempted.add(new DeployedTask(worker, chain.head().id(), subtask));
+                    DeployAck ack = deploymentRpc.deploy(worker, deployment);
 
-                if (!ack.getAccepted()) {
-                    throw new IllegalStateException("worker " + worker.workerId()
-                            + " refused " + chain.id() + ":" + subtask + " -- " + ack.getReason());
+                    if (!ack.getAccepted()) {
+                        throw new IllegalStateException("worker " + worker.workerId()
+                                + " refused " + chain.id() + ":" + subtask + " -- " + ack.getReason());
+                    }
+                    log.info("deployed {}:{} to {}", chain.id(), subtask, worker.workerId());
                 }
-                log.info("deployed {}:{} to {}", chain.id(), subtask, worker.workerId());
+            }
+        } catch (RuntimeException deploymentFailure) {
+            rollbackDeployment(graph.jobId(), attempted);
+            throw deploymentFailure;
+        }
+    }
+
+    /** Removes a partially installed generation before the restart policy makes another attempt. */
+    private void rollbackDeployment(String jobId, List<DeployedTask> deployed) {
+        for (int index = deployed.size() - 1; index >= 0; index--) {
+            DeployedTask task = deployed.get(index);
+            try {
+                cancellationRpc.cancel(task.worker(), TaskId.newBuilder()
+                        .setJobId(jobId)
+                        .setOperatorId(task.operatorId())
+                        .setSubtaskIndex(task.subtaskIndex())
+                        .build());
+            } catch (Exception rollbackFailure) {
+                log.warn("could not roll back {}:{} on {}: {}", task.operatorId(),
+                        task.subtaskIndex(), task.worker().workerId(), rollbackFailure.getMessage());
             }
         }
+    }
+
+    private record DeployedTask(RegisteredWorker worker, String operatorId, int subtaskIndex) {
+    }
+
+    @FunctionalInterface
+    interface DeploymentRpc {
+        DeployAck deploy(RegisteredWorker worker, TaskDeployment deployment);
+    }
+
+    @FunctionalInterface
+    interface CancellationRpc {
+        void cancel(RegisteredWorker worker, TaskId task);
     }
 
     private TaskDeployment buildDeployment(JobGraph graph,
                                            ExecutionGraph plan,
                                            ChainGroup chain,
                                            int subtaskIndex,
-                                           RegisteredWorker worker) {
+                                           RegisteredWorker worker,
+                                           Map<String, String> stateHandles) {
 
         TaskDeployment.Builder deployment = TaskDeployment.newBuilder()
                 .setJobId(graph.jobId())
                 .setChainGroupId(chain.id())
                 .setSubtaskIndex(subtaskIndex)
                 .setParallelism(chain.parallelism());
+
+        String stateHandle = stateHandles.get(chain.head().id() + ":" + subtaskIndex);
+        if (stateHandle != null) {
+            deployment.setStateHandleUri(stateHandle);
+        }
 
         for (LogicalOperator operator : chain.operators()) {
             deployment.addOperators(serializeOperator(operator));
@@ -183,13 +270,11 @@ public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
             }
             ChainGroup chain = plan.chainGroup(assignment.chainGroupId()).orElseThrow();
             try {
-                stubFor(worker)
-                        .withDeadlineAfter(5, TimeUnit.SECONDS)
-                        .cancelTask(TaskId.newBuilder()
-                                .setJobId(jobId)
-                                .setOperatorId(chain.head().id())
-                                .setSubtaskIndex(assignment.subtaskIndex())
-                                .build());
+                cancellationRpc.cancel(worker, TaskId.newBuilder()
+                        .setJobId(jobId)
+                        .setOperatorId(chain.head().id())
+                        .setSubtaskIndex(assignment.subtaskIndex())
+                        .build());
             } catch (Exception e) {
                 log.warn("could not cancel {} on {}: {}",
                         key, worker.workerId(), e.getMessage());
@@ -232,6 +317,69 @@ public final class GrpcTaskDeployer implements TaskDeployer, AutoCloseable {
     private static boolean isForward(LogicalOperator operator) {
         return ChainBuilder.inputExchangeOf(operator)
                 == dev.dhruv.streaming.api.ExchangeStrategy.FORWARD;
+    }
+
+    @Override
+    public void triggerSources(JobGraph graph, ExecutionGraph plan,
+                               long checkpointId, long triggerTimestamp) {
+        // TaskManager injects into every matching source it hosts. One RPC per worker is
+        // therefore deliberate: calling once per source subtask would inject duplicate barriers
+        // when a worker owns more than one source partition.
+        java.util.Set<RegisteredWorker> sourceWorkers = new LinkedHashSet<>();
+        for (ChainGroup chain : plan.chainGroups()) {
+            if (!(chain.head() instanceof SourceNode)) {
+                continue;
+            }
+            for (int subtask = 0; subtask < chain.parallelism(); subtask++) {
+                sourceWorkers.add(workerFor(plan, chain.id(), subtask));
+            }
+        }
+        sourceWorkers.forEach(worker -> stubFor(worker).withDeadlineAfter(5, TimeUnit.SECONDS)
+                .triggerCheckpoint(CheckpointTrigger.newBuilder()
+                        .setCheckpointId(checkpointId)
+                        .setTriggerTs(triggerTimestamp)
+                        .setJobId(graph.jobId())
+                        .build()));
+    }
+
+    @Override
+    public void notifySinks(JobGraph graph, ExecutionGraph plan, long checkpointId) {
+        for (ChainGroup chain : plan.chainGroups()) {
+            if (!(chain.tail() instanceof SinkNode)) {
+                continue;
+            }
+            for (int subtask = 0; subtask < chain.parallelism(); subtask++) {
+                RegisteredWorker worker = workerFor(plan, chain.id(), subtask);
+                stubFor(worker).withDeadlineAfter(5, TimeUnit.SECONDS)
+                        .notifyCheckpointComplete(CheckpointId.newBuilder()
+                                .setCheckpointId(checkpointId)
+                                .setJobId(graph.jobId())
+                                .build());
+            }
+        }
+    }
+
+    @Override
+    public void abortCheckpoint(JobGraph graph, ExecutionGraph plan, long checkpointId) {
+        java.util.Set<RegisteredWorker> jobWorkers = new LinkedHashSet<>();
+        plan.workerIds().forEach(workerId -> {
+            RegisteredWorker worker = workersById.get(workerId);
+            if (worker != null) {
+                jobWorkers.add(worker);
+            }
+        });
+        jobWorkers.forEach(worker -> {
+            try {
+                stubFor(worker).withDeadlineAfter(5, TimeUnit.SECONDS)
+                        .abortCheckpoint(CheckpointId.newBuilder()
+                                .setCheckpointId(checkpointId)
+                                .setJobId(graph.jobId())
+                                .build());
+            } catch (RuntimeException failure) {
+                log.warn("could not abort checkpoint {} on {}: {}", checkpointId,
+                        worker.workerId(), failure.getMessage());
+            }
+        });
     }
 
     private static Optional<dev.dhruv.streaming.api.KeySelector<?, ?>> keySelectorOf(

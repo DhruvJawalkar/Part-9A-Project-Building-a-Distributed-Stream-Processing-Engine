@@ -58,4 +58,19 @@ class WatermarkTrackerTest {
         // remaining input that governs progress.
         assertThat(tracker.onWatermark(1, new Watermark(200L))).contains(new Watermark(200L));
     }
+
+    @Test
+    void snapshotRestoresPerChannelProgressAndSuppressesRegressedWatermarks() {
+        WatermarkTracker original = new WatermarkTracker(2);
+        original.onWatermark(0, new Watermark(120L));
+        original.onWatermark(1, new Watermark(100L));
+
+        WatermarkTracker restored = new WatermarkTracker(2);
+        restored.restore(original.snapshot());
+
+        assertThat(restored.currentWatermark()).isEqualTo(100L);
+        assertThat(restored.onWatermark(1, new Watermark(90L))).isEmpty();
+        assertThat(restored.onWatermark(1, new Watermark(130L)))
+                .contains(new Watermark(120L));
+    }
 }

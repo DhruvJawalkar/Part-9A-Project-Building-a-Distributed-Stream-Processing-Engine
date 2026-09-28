@@ -1,6 +1,6 @@
 # Engine design
 
-This living design document records what is implemented through **Phase 3** and labels later
+This living design document records what is implemented through **Phase 4** and labels later
 work as **planned**. This is a teaching engine: its source shows the mechanism directly instead
 of hiding it behind a production framework.
 
@@ -14,7 +14,7 @@ authoritative build sequence is in [CLAUDE.md](../CLAUDE.md).
 | 1 | Complete | Local task runtime, logical DAG, Kafka source and console sink |
 | 2 | Complete | Master/worker deployment, etcd, gRPC transport and failure detection |
 | 3 | Complete | Event time, watermarks/idleness, keyed state/timers and sessions |
-| 4 | **Planned** | Coordinated checkpoints, barrier alignment and whole-job recovery |
+| 4 | Complete | Aligned checkpoints, RocksDB state, MinIO archives and whole-job recovery |
 | 5 | **Planned** | Event-time interval join |
 | 6 | **Planned** | Transactional Iceberg output |
 | 7 | **Planned** | Status API, dashboard and reproducible demos |
@@ -31,6 +31,9 @@ authoritative build sequence is in [CLAUDE.md](../CLAUDE.md).
   subtasks, exchanges, chain groups and worker assignments.
 - **Legibility wins.** A keyed task is a chain boundary until state namespaces can be per-operator
   inside a fused chain.
+- **Recovery follows one distributed cut.** A task failure cancels and restores every task from
+  the same completed checkpoint. Restarting only the failed task could pair replayed input with
+  downstream tasks that had already processed beyond that point.
 
 ## Computation DAG
 
@@ -84,8 +87,8 @@ JobClient -- SubmitJob --> JobMaster -- DeployTask --> Worker TaskManager
 - `GrpcTaskDeployer` sends serialized operators, input/output channels, event-time settings and
   downstream key selectors to workers.
 - `TaskManager` creates the local source/operator tasks, input gates and result partitions.
-- Through Phase 3, a worker loss fails the job. Heap state and source offsets do not yet form a
-  coordinated recovery point.
+- The Phase 4 `CheckpointCoordinator` owns interval triggers, completion and timeout. Checkpoint
+  acknowledgements and completion/abort commands use the master/worker gRPC control plane.
 
 ## Data plane and backpressure
 
@@ -134,9 +137,10 @@ into a false task end.
 
 ## Keyed state and timers
 
-`InMemoryStateBackend` implements `StateBackend` for Phase 3. It keeps named value/list state,
-each indexed by current key. It can produce local snapshot handles, but those handles are not yet
-coordinated across a job.
+`InMemoryStateBackend` remains useful for local execution and unit tests. Distributed operator
+tasks use `RocksDbStateBackend`: named value/list state is stored in RocksDB column families and
+indexed by current key. Each operator checkpoint also captures pending event-time timers and
+watermark progress; restoring only the accumulator would leave an open session that never fires.
 
 ```text
 record for member-42
@@ -167,30 +171,92 @@ allowed-lateness reopening policy.
 `FileReplaySource` provides bounded JSON Lines input for deterministic replay. Stable line-hash
 partitioning gives the same source ownership on each replay with the same parallelism.
 
-## Fault tolerance and recovery
+## Checkpoint protocol and fault tolerance
 
-### Implemented through Phase 3
+The master triggers checkpoints on a configurable interval (10 seconds by default) and allows a
+configurable timeout (30 seconds by default). The coordinator sends a trigger only to source tasks.
+`MasterBootstrap` reads the interval, timeout, restart-attempt count and restart delay from
+environment overrides used by the cluster launcher.
+Each source takes a snapshot on its own task thread at a record boundary, then emits the barrier
+into the ordinary ordered data channels. This gives every downstream task the same stream cut
+without asking unrelated tasks to snapshot at arbitrary instants.
 
-The master detects a lost worker and fails the job. Local heap state is not reused, and Kafka
-offsets remain connector-managed. The end-to-end guarantee is therefore at-least-once, not
-exactly-once.
+For a task with multiple physical input channels, `BarrierAligner` blocks a channel as soon as its
+barrier arrives. The task keeps consuming the other channels, whose pre-barrier records still
+belong to the snapshot. When all channels have delivered the matching barrier, the task follows
+this order:
 
-### Planned Phase 4: checkpoints and recovery
+```text
+snapshot state + timers + watermark progress
+             ↓
+forward barrier downstream
+             ↓
+acknowledge snapshot to the master
+             ↓
+unblock channels and process buffered post-barrier records
+```
 
-`CheckpointCoordinator` will inject barriers at sources. `BarrierAligner` will block an input
-when its barrier arrives while still consuming unblocked channels; once all checkpoint barriers
-arrive, the task will snapshot state, forward its barrier, acknowledge, then drain buffered data.
-Single-input tasks do not need alignment.
+Forwarding before acknowledgement matters: the coordinator can complete only when every physical
+task in the execution plan has acknowledged. Single-input tasks skip channel blocking and take the
+same snapshot/forward/ack path directly. If a checkpoint times out, the master sends an abort to
+workers so any channels held by that incomplete alignment are released.
 
-The coordinator will complete only after every task acknowledges, persist the completed pointer
-in etcd, and notify sinks. Recovery will cancel and redeploy the whole job from the latest
-checkpoint, restoring state and seeking sources to checkpoint offsets. Restarting every task is
-intentional: one task alone could combine incompatible prefixes of a distributed cut.
+Each worker first writes the task snapshot to local files. `RocksDbStateBackend` snapshots its
+database; the task envelope records its state handle together with pending timer data and event-time
+progress. Sources add connector position and watermark-generator state. `KafkaSource` assigns
+partitions explicitly and snapshots the next offsets without committing them to Kafka. On restore,
+the new source seeks to the checkpointed offsets before polling resumes.
+
+The worker packages the entire task checkpoint directory as a ZIP and publishes it through
+`CheckpointStorage`. In a cluster, `MinioCheckpointStorage` stores the immutable archive in the
+configured MinIO bucket. File handles nested inside the archive are relative paths, not paths from
+the producing worker's disk. On recovery, any worker can download and materialize the archive into
+its own checkpoint directory. A filesystem archive implementation supports tests and local use.
+
+The coordinator expects one acknowledgement per chain-group subtask. An acknowledgement carries a
+state handle, alignment time and state size. Only when every expected task has acknowledged does
+the coordinator persist the completed checkpoint pointer and all task handles to etcd; only after
+that durable write does it send the completion notification. Incomplete timed-out checkpoints are
+aborted and never become recovery points.
+
+On worker failure, the job moves to `FAILING`, all tasks are cancelled, and the master loads the
+latest completed checkpoint. It then moves to `RESTARTING`, waits the fixed delay, and redeploys the
+entire graph with each task's corresponding handle. The default policy permits three attempts,
+one second apart; without a completed checkpoint or after attempts are exhausted, the job becomes
+`FAILED`. Workers declared dead are quarantined from scheduling while their etcd lease may still
+exist. Fresh registration makes a worker eligible again.
+
+Workers reopen their heartbeat stream after a master interruption. The first beat seeds the new
+master's in-memory failure detector, while etcd supplies the durable worker addresses and recovered
+execution plan. For bounded jobs, the master retains the latest task statuses and marks the job
+`FINISHED` only after every physical task reports completion; checkpoint scheduling stops then.
+
+### Phase 4 runtime evidence
+
+`DistributedCheckpointRecoveryIT` supplies the automated process-level acceptance proof; run it
+with `./gradlew :lms-job:integrationTest`. Testcontainers runs etcd and MinIO while the test
+starts a real master and three worker child JVMs. The five-task bounded job completes a checkpoint
+while the sink has emitted zero bytes. The test then force-kills the session owner selected by
+`KeyGroupAssigner`, verifies the tasks are reassigned without the dead worker, and waits for the
+bounded job to reach `FINISHED`. Output is byte-identical to a clean baseline run.
+
+The live three-worker recovery run used 10 tasks. Checkpoints 1–5 completed with a handle for each
+task in etcd and MinIO. After worker-2 was killed, the detector declared it dead after three missed
+one-second beats (about 3.47 seconds). The master identified `clicks:1`, `sessions:0`, and
+`sessions:3` as lost tasks, cancelled the full graph, and restarted attempt 1/3 from checkpoint 5
+on worker-1 and worker-3. The new assignments excluded worker-2; checkpoint 6 and later again
+completed with 10 handles, with `minio://` state handles including source and operator envelopes.
+
+The process-level test verifies bounded completion and byte equality through real master/worker
+processes. The separate `SessionPipelineRecoveryAcceptanceTest` compares the recovered
+source/session/sink pipeline with a clean fixed replay, while the MinIO integration test deletes
+the producer-side checkpoint directory before restoring the archive on a different filesystem root.
 
 ## Connectors
 
-- **KafkaSource (implemented):** pull-based LMS input; Kafka owns offsets until planned
-  checkpoint integration takes them into snapshots.
+- **KafkaSource (implemented):** pull-based LMS input with explicit partition assignment and
+  checkpointed next offsets. Restore seeks to those offsets; the broker's committed offsets are
+  not the recovery position.
 - **ConsoleSink (implemented):** a normal `Operator<T, Void>` for visible output.
 - **FileReplaySource (implemented):** bounded fixture source for deterministic tests/demos.
 - **IcebergSink (planned, Phase 6):** will pre-commit files into state and atomically append them
@@ -198,10 +264,10 @@ intentional: one task alone could combine incompatible prefixes of a distributed
 
 ## Observability
 
-Implemented metrics include per-subtask record counts; task logs and master/worker heartbeats
-show lifecycle and liveness.
-
-**Planned Phase 4:** checkpoint duration, state size and barrier-alignment time in acknowledgements.
+Implemented metrics include per-subtask record counts and the latest checkpoint id, snapshot
+duration, state size in bytes, and barrier-alignment time. Worker heartbeats carry these samples,
+and the master retains the latest status per physical task; Phase 7 exposes that registry through
+scrape endpoints and dashboards.
 
 **Planned Phase 7:** REST status, Prometheus endpoints and Grafana panels for source lag,
 checkpoint duration/alignment, records-in skew and state size. Scripted fixture demos will cover
@@ -210,6 +276,7 @@ worker loss mid-window, master loss, a late event and a hot key.
 ## Deliberate limitations
 
 There is one master, fixed parallelism, no savepoints, no dynamic rescaling, no SQL layer, and no
-security/multi-tenancy/resource isolation. Checkpointing, recovery, joins, Iceberg and
-operational APIs are planned rather than implicit. These omissions are visible so the code shows
-which production-system mechanism solves each problem.
+security/multi-tenancy/resource isolation. Checkpoint recovery is implemented, but the console
+sink is not transactional; exactly-once external output awaits the Phase 6 Iceberg commit protocol.
+The interval join and operational APIs remain planned. These omissions are visible so the code
+shows which production-system mechanism solves each problem.

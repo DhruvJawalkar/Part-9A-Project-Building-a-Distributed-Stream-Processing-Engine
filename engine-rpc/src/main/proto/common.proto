@@ -30,6 +30,6 @@ enum JobState {
   JOB_FINISHED = 3;
   JOB_FAILING = 4;
   JOB_FAILED = 5;
-  // Phase 4 adds JOB_RESTARTING between FAILING and RUNNING. Phase 2 has nothing to recover
-  // to, so a failure here is terminal.
+  // Persisted before every whole-job redeployment from a completed checkpoint.
+  JOB_RESTARTING = 6;
 }

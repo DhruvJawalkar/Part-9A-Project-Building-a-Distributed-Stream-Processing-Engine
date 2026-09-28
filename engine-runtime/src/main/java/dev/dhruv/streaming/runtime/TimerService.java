@@ -2,7 +2,10 @@ package dev.dhruv.streaming.runtime;
 
 import dev.dhruv.streaming.api.state.StateBackend;
 
+import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -71,6 +74,51 @@ public final class TimerService {
     /** Returns the number of distinct key/timestamp timer registrations still pending. */
     public int timerCount() {
         return timersByTimestamp.values().stream().mapToInt(LinkedHashSet::size).sum();
+    }
+
+    /**
+     * Captures the event-time clock and all not-yet-fired keyed timers for a task checkpoint.
+     *
+     * <p>Timer state deliberately remains a small task-level snapshot rather than masquerading
+     * as user keyed state in {@link StateBackend}. A checkpoint containing only an operator's
+     * accumulator could restore an open session but never fire it; this value is the other half
+     * of a keyed operator's recoverable state. The task checkpoint envelope owns serialization
+     * and storage of this record alongside its {@code StateHandle}.
+     */
+    public TimerSnapshot snapshot() {
+        List<TimerRegistration> registrations = new ArrayList<>();
+        timersByTimestamp.forEach((timestamp, keys) ->
+                keys.forEach(key -> registrations.add(new TimerRegistration(timestamp, key))));
+        return new TimerSnapshot(currentWatermark, List.copyOf(registrations));
+    }
+
+    /**
+     * Replaces timer state from a task checkpoint. This is a whole-state replacement, just like
+     * {@link StateBackend#restore(dev.dhruv.streaming.api.state.StateHandle)}: merge semantics
+     * would retain timers registered after the checkpoint and fire them twice after recovery.
+     */
+    public void restore(TimerSnapshot snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        timersByTimestamp.clear();
+        currentWatermark = snapshot.currentWatermark();
+        for (TimerRegistration registration : snapshot.registrations()) {
+            registerEventTimeTimer(registration.key(), registration.timestamp());
+        }
+    }
+
+    /** Serializable task-level timer snapshot, intended for a checkpoint envelope. */
+    public record TimerSnapshot(long currentWatermark, List<TimerRegistration> registrations)
+            implements Serializable {
+        public TimerSnapshot {
+            registrations = List.copyOf(registrations);
+        }
+    }
+
+    /** One pending timer; the key is restored before the callback runs. */
+    public record TimerRegistration(long timestamp, Object key) implements Serializable {
+        public TimerRegistration {
+            Objects.requireNonNull(key, "key");
+        }
     }
 
     /** Callback used by the task loop to restore key context before invoking a keyed operator. */

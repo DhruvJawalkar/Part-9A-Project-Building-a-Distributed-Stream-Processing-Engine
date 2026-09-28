@@ -1,18 +1,24 @@
 package dev.dhruv.streaming.worker;
 
 import dev.dhruv.streaming.api.ExchangeStrategy;
+import dev.dhruv.streaming.api.CheckpointBarrier;
 import dev.dhruv.streaming.api.Operator;
 import dev.dhruv.streaming.api.KeySelector;
 import dev.dhruv.streaming.api.Source;
 import dev.dhruv.streaming.api.TimestampAssigner;
+import dev.dhruv.streaming.api.state.StateHandle;
 import dev.dhruv.streaming.rpc.ChainedOperator;
 import dev.dhruv.streaming.rpc.InputChannel;
 import dev.dhruv.streaming.rpc.OperatorKind;
 import dev.dhruv.streaming.rpc.OutputChannel;
 import dev.dhruv.streaming.rpc.TaskDeployment;
+import dev.dhruv.streaming.rpc.CheckpointAck;
+import dev.dhruv.streaming.rpc.TaskId;
+import dev.dhruv.streaming.rpc.CheckpointTrigger;
 import dev.dhruv.streaming.runtime.OperatorChain;
 import dev.dhruv.streaming.runtime.OperatorTask;
 import dev.dhruv.streaming.runtime.RuntimeSourceContext;
+import dev.dhruv.streaming.runtime.RocksDbStateBackend;
 import dev.dhruv.streaming.runtime.SerializationUtil;
 import dev.dhruv.streaming.runtime.SourceTask;
 import dev.dhruv.streaming.runtime.metrics.TaskMetricGroup;
@@ -22,6 +28,8 @@ import dev.dhruv.streaming.runtime.transport.ResultPartitionWriter;
 import dev.dhruv.streaming.runtime.transport.ResultSubpartition;
 import dev.dhruv.streaming.runtime.transport.Subpartitions;
 import dev.dhruv.streaming.runtime.transport.TaskInputRegistry;
+import dev.dhruv.streaming.worker.checkpoint.CheckpointStorage;
+import dev.dhruv.streaming.worker.checkpoint.FileSystemCheckpointStorage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,11 +38,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Base64;
+import java.util.UUID;
+import java.nio.file.Path;
+import java.net.URI;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.function.BiConsumer;
 
 /**
  * Turns a {@code TaskDeployment} into running threads on this worker.
@@ -67,9 +79,13 @@ public final class TaskManager implements AutoCloseable {
     private final TaskInputRegistry inputRegistry;
     private final DataTransportClient transportClient;
     private final ScheduledExecutorService bufferFlusher;
+    private final Path checkpointRoot;
+    private final CheckpointStorage checkpointStorage;
 
     private final Map<String, RunningTask> tasks = new ConcurrentHashMap<>();
-    private BiConsumer<String, Throwable> failureListener = (taskId, failure) -> {
+    private TaskFailureListener failureListener = (jobId, taskId, failure) -> {
+    };
+    private java.util.function.Consumer<CheckpointAck> checkpointAcknowledgement = acknowledgement -> {
     };
 
     /**
@@ -86,11 +102,44 @@ public final class TaskManager implements AutoCloseable {
                        int dataPort,
                        TaskInputRegistry inputRegistry,
                        DataTransportClient transportClient) {
+        this(workerId, host, dataPort, inputRegistry, transportClient,
+                Path.of(System.getProperty("java.io.tmpdir"), "distributed-stream-processing-engine",
+                        "checkpoints"));
+    }
+
+    /**
+     * Creates a task manager with an explicit durable checkpoint root.
+     *
+     * @param checkpointRoot directory shared by the worker processes that may restore this job
+     */
+    public TaskManager(String workerId,
+                       String host,
+                       int dataPort,
+                       TaskInputRegistry inputRegistry,
+                       DataTransportClient transportClient,
+                       Path checkpointRoot) {
+        this(workerId, host, dataPort, inputRegistry, transportClient, checkpointRoot,
+                new FileSystemCheckpointStorage(checkpointRoot.resolve("archives")));
+    }
+
+    /**
+     * Creates a task manager with explicit local staging and durable checkpoint storage.
+     * The separate locations are intentional: staging is worker-local, the storage handle is not.
+     */
+    public TaskManager(String workerId,
+                       String host,
+                       int dataPort,
+                       TaskInputRegistry inputRegistry,
+                       DataTransportClient transportClient,
+                       Path checkpointRoot,
+                       CheckpointStorage checkpointStorage) {
         this.workerId = workerId;
         this.host = host;
         this.dataPort = dataPort;
         this.inputRegistry = inputRegistry;
         this.transportClient = transportClient;
+        this.checkpointRoot = checkpointRoot.toAbsolutePath();
+        this.checkpointStorage = checkpointStorage;
         this.bufferFlusher = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "buffer-flusher");
             thread.setDaemon(true);
@@ -103,8 +152,13 @@ public final class TaskManager implements AutoCloseable {
      *
      * @param listener called with the task id and the failure
      */
-    public void onTaskFailure(BiConsumer<String, Throwable> listener) {
+    public void onTaskFailure(TaskFailureListener listener) {
         this.failureListener = listener;
+    }
+
+    /** Registers the control-plane callback for task checkpoint acknowledgements. */
+    public void onCheckpointAcknowledgement(java.util.function.Consumer<CheckpointAck> listener) {
+        this.checkpointAcknowledgement = listener;
     }
 
     /**
@@ -113,10 +167,13 @@ public final class TaskManager implements AutoCloseable {
      * @param deployment everything the task needs
      * @return the task's key on this worker
      */
-    public String deploy(TaskDeployment deployment) {
+    public synchronized String deploy(TaskDeployment deployment) {
         String headOperatorId = deployment.getOperators(0).getOperatorId();
         int subtask = deployment.getSubtaskIndex();
         String taskKey = TaskInputRegistry.taskKey(headOperatorId, subtask);
+        if (tasks.containsKey(taskKey)) {
+            throw new IllegalStateException("task " + taskKey + " is still running");
+        }
 
         log.info("deploying {} ({}/{}) : {}", headOperatorId, subtask + 1,
                 deployment.getParallelism(),
@@ -132,15 +189,15 @@ public final class TaskManager implements AutoCloseable {
                 ? buildSourceTask(deployment, taskKey, output, metrics)
                 : buildOperatorTask(deployment, taskKey, gate, output, metrics);
 
-        Thread thread = new Thread(task, taskKey);
-        tasks.put(taskKey, new RunningTask(taskKey, headOperatorId, subtask, task, thread,
-                output, metrics));
-
         // Ship partly-filled buffers on a timer, so a trickle of records is not held hostage by
         // a batch that will never fill.
-        bufferFlusher.scheduleAtFixedRate(() -> flushQuietly(output),
+        ScheduledFuture<?> flushTask = bufferFlusher.scheduleAtFixedRate(() -> flushQuietly(output),
                 DEFAULT_BUFFER_TIMEOUT_MILLIS, DEFAULT_BUFFER_TIMEOUT_MILLIS,
                 TimeUnit.MILLISECONDS);
+
+        Thread thread = new Thread(task, taskKey);
+        tasks.put(taskKey, new RunningTask(taskKey, deployment.getJobId(), headOperatorId, subtask,
+                task, thread, output, flushTask, metrics));
 
         thread.start();
         return taskKey;
@@ -258,7 +315,14 @@ public final class TaskManager implements AutoCloseable {
                 head.getOutOfOrdernessMillis(),
                 head.getIdleTimeoutMillis(),
                 metrics);
-        task.onFailure(failureListener);
+        if (!deployment.getStateHandleUri().isBlank()) {
+            task.restore(materializeRestoreHandle(deployment, taskKey));
+        }
+        task.onCheckpoint(result -> result.stateHandle().ifPresent(handle ->
+                acknowledgeCheckpoint(deployment, taskKey, result.checkpointId(), handle,
+                        result.alignmentMillis())));
+        task.onFailure((ignored, failure) ->
+                failureListener.failed(deployment.getJobId(), taskKey, failure));
         return task;
     }
 
@@ -293,8 +357,26 @@ public final class TaskManager implements AutoCloseable {
         Optional<KeySelector<?, ?>> keySelector = SerializationUtil.fromBytesOrEmpty(
                 deployment.getOperators(0).getSerializedKeySelector().toByteArray());
 
-        OperatorTask task = new OperatorTask(taskKey, operator, gate, output, keySelector, metrics);
-        task.onFailure(failureListener);
+        Path taskRoot = checkpointRoot
+                .resolve(deployment.getJobId())
+                .resolve(taskKey.replace('#', '_'));
+        RocksDbStateBackend stateBackend;
+        try {
+            stateBackend = new RocksDbStateBackend(taskRoot.resolve("live-rocksdb"));
+        } catch (java.io.IOException failure) {
+            throw new IllegalStateException("could not open RocksDB for " + taskKey, failure);
+        }
+
+        OperatorTask task = new OperatorTask(taskKey, operator, gate, output, keySelector,
+                stateBackend, taskRoot.resolve("completed"), metrics);
+        if (!deployment.getStateHandleUri().isBlank()) {
+            task.restore(materializeRestoreHandle(deployment, taskKey));
+        }
+        ChainedOperator head = deployment.getOperators(0);
+        task.onCheckpoint(result -> acknowledgeCheckpoint(deployment, taskKey, result.checkpointId(),
+                result.stateHandle(), result.alignmentMillis()));
+        task.onFailure((ignored, failure) ->
+                failureListener.failed(deployment.getJobId(), taskKey, failure));
         return task;
     }
 
@@ -304,13 +386,28 @@ public final class TaskManager implements AutoCloseable {
      * @param operatorId   the operator
      * @param subtaskIndex which subtask
      */
-    public void cancel(String operatorId, int subtaskIndex) {
-        RunningTask task = tasks.remove(TaskInputRegistry.taskKey(operatorId, subtaskIndex));
+    public synchronized void cancel(String operatorId, int subtaskIndex) {
+        String taskKey = TaskInputRegistry.taskKey(operatorId, subtaskIndex);
+        RunningTask task = tasks.get(taskKey);
         if (task == null) {
             return;
         }
         log.info("cancelling {}", task.taskKey());
         task.cancel();
+        try {
+            task.thread().join(2_000);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while waiting for " + taskKey
+                    + " to stop", interrupted);
+        }
+        if (task.isAlive()) {
+            // Do not remove or replace it. Deploying a restored copy under the same identity
+            // while this thread can still emit would create two histories after one checkpoint.
+            throw new IllegalStateException("task " + taskKey
+                    + " did not stop before recovery redeployment");
+        }
+        tasks.remove(taskKey, task);
         inputRegistry.unregister(operatorId, subtaskIndex);
     }
 
@@ -328,6 +425,103 @@ public final class TaskManager implements AutoCloseable {
      */
     public Map<String, RunningTask> runningTasks() {
         return Map.copyOf(tasks);
+    }
+
+    /**
+     * Injects a checkpoint barrier into every source currently hosted by this worker.
+     *
+     * <p>Only source tasks receive a control-plane trigger. Every other task learns of the
+     * checkpoint through its ordered input channels, which is the consistency property that
+     * barrier alignment preserves.
+     */
+    public void triggerCheckpoint(CheckpointTrigger trigger) throws Exception {
+        CheckpointBarrier barrier = new CheckpointBarrier(trigger.getCheckpointId(), trigger.getTriggerTs());
+        for (RunningTask task : List.copyOf(tasks.values())) {
+            if (task.jobId().equals(trigger.getJobId()) && task.task() instanceof SourceTask source) {
+                Path taskCheckpointDirectory = checkpointRoot
+                        .resolve(trigger.getJobId())
+                        .resolve(task.taskKey().replace('#', '_'))
+                        .resolve("checkpoint-" + trigger.getCheckpointId());
+                source.triggerCheckpoint(barrier, taskCheckpointDirectory);
+            }
+        }
+    }
+
+    /** Releases operator channels held by an abandoned checkpoint for one job. */
+    public void abortCheckpoint(String jobId, long checkpointId) {
+        for (RunningTask task : List.copyOf(tasks.values())) {
+            if (task.jobId().equals(jobId) && task.task() instanceof OperatorTask operator) {
+                operator.abortCheckpoint(checkpointId);
+            }
+        }
+    }
+
+    /** Publishes a fully written local task snapshot before its acknowledgement reaches the master. */
+    private void acknowledgeCheckpoint(TaskDeployment deployment,
+                                       String taskKey,
+                                       long checkpointId,
+                                       StateHandle localHandle,
+                                       long alignmentMillis) {
+        try {
+            Path entryPoint = Path.of(localHandle.uri()).toAbsolutePath().normalize();
+            Path checkpointDirectory = entryPoint.getParent();
+            if (checkpointDirectory == null) {
+                throw new java.io.IOException("checkpoint entry point has no parent: " + entryPoint);
+            }
+            StateHandle durableHandle = checkpointStorage.publish(
+                    checkpointObjectKey(deployment.getJobId(), taskKey, checkpointId),
+                    checkpointDirectory, localHandle);
+            checkpointAcknowledgement.accept(CheckpointAck.newBuilder()
+                    .setWorkerId(workerId)
+                    .setTaskId(TaskId.newBuilder()
+                            .setJobId(deployment.getJobId())
+                            .setOperatorId(deployment.getOperators(0).getOperatorId())
+                            .setSubtaskIndex(deployment.getSubtaskIndex()))
+                    .setCheckpointId(checkpointId)
+                    .setStateHandleUri(durableHandle.uri().toString())
+                    .setStateSizeBytes(durableHandle.sizeBytes())
+                    .setAlignmentMillis(alignmentMillis)
+                    .build());
+        } catch (Exception failure) {
+            throw new CheckpointPublicationException("could not publish checkpoint " + checkpointId
+                    + " for " + taskKey, failure);
+        }
+    }
+
+    /** Downloads an immutable archive to this worker before the task's local restore begins. */
+    private StateHandle materializeRestoreHandle(TaskDeployment deployment, String taskKey) {
+        try {
+            Path target = checkpointRoot.resolve("restored")
+                    .resolve(encodedComponent(deployment.getJobId()))
+                    .resolve(encodedComponent(taskKey))
+                    .resolve(UUID.randomUUID().toString());
+            return checkpointStorage.materialize(new StateHandle(
+                    URI.create(deployment.getStateHandleUri()), 0), target);
+        } catch (Exception failure) {
+            throw new IllegalStateException("could not materialize checkpoint for " + taskKey, failure);
+        }
+    }
+
+    private static String checkpointObjectKey(String jobId, String taskKey, long checkpointId) {
+        return "jobs/" + encodedComponent(jobId) + "/tasks/" + encodedComponent(taskKey)
+                + "/checkpoint-" + checkpointId + ".zip";
+    }
+
+    private static String encodedComponent(String value) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private static final class CheckpointPublicationException extends RuntimeException {
+        private CheckpointPublicationException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /** Carries the job identity that a task-local id alone cannot provide. */
+    @FunctionalInterface
+    public interface TaskFailureListener {
+        void failed(String jobId, String taskId, Throwable failure);
     }
 
     @Override

@@ -4,6 +4,7 @@ import dev.dhruv.streaming.api.Watermark;
 
 import java.util.Arrays;
 import java.util.Optional;
+import java.io.Serializable;
 
 /**
  * Maintains one watermark per input channel and exposes their minimum as a task's event-time
@@ -89,6 +90,26 @@ public final class WatermarkTracker {
         return currentWatermark;
     }
 
+    /** Captures per-channel event-time progress as part of an operator checkpoint. */
+    public Snapshot snapshot() {
+        return new Snapshot(channelWatermarks.clone(), idleChannels.clone(),
+                endedChannels.clone(), currentWatermark);
+    }
+
+    /** Restores event-time progress before any post-checkpoint input is processed. */
+    public void restore(Snapshot snapshot) {
+        if (snapshot.channelWatermarks().length != channelWatermarks.length
+                || snapshot.idleChannels().length != idleChannels.length
+                || snapshot.endedChannels().length != endedChannels.length) {
+            throw new IllegalArgumentException("watermark snapshot channel count does not match task");
+        }
+        System.arraycopy(snapshot.channelWatermarks(), 0, channelWatermarks, 0,
+                channelWatermarks.length);
+        System.arraycopy(snapshot.idleChannels(), 0, idleChannels, 0, idleChannels.length);
+        System.arraycopy(snapshot.endedChannels(), 0, endedChannels, 0, endedChannels.length);
+        currentWatermark = snapshot.currentWatermark();
+    }
+
     /** Returns whether a particular input is currently excluded from the minimum. */
     public boolean isIdle(int channelIndex) {
         checkChannel(channelIndex);
@@ -138,6 +159,32 @@ public final class WatermarkTracker {
     private void checkChannel(int channelIndex) {
         if (channelIndex < 0 || channelIndex >= channelWatermarks.length) {
             throw new IndexOutOfBoundsException("unknown input channel " + channelIndex);
+        }
+    }
+
+    /** Immutable serialized form used by task checkpoint envelopes. */
+    public record Snapshot(long[] channelWatermarks, boolean[] idleChannels,
+                           boolean[] endedChannels, long currentWatermark)
+            implements Serializable {
+        public Snapshot {
+            channelWatermarks = channelWatermarks.clone();
+            idleChannels = idleChannels.clone();
+            endedChannels = endedChannels.clone();
+        }
+
+        @Override
+        public long[] channelWatermarks() {
+            return channelWatermarks.clone();
+        }
+
+        @Override
+        public boolean[] idleChannels() {
+            return idleChannels.clone();
+        }
+
+        @Override
+        public boolean[] endedChannels() {
+            return endedChannels.clone();
         }
     }
 }

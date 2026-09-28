@@ -12,6 +12,9 @@ import dev.dhruv.streaming.runtime.transport.DataTransportService;
 import dev.dhruv.streaming.runtime.transport.Subpartitions;
 import dev.dhruv.streaming.runtime.UserCodeClassLoader;
 import dev.dhruv.streaming.runtime.transport.TaskInputRegistry;
+import dev.dhruv.streaming.worker.checkpoint.CheckpointStorage;
+import dev.dhruv.streaming.worker.checkpoint.FileSystemCheckpointStorage;
+import dev.dhruv.streaming.worker.checkpoint.MinioCheckpointStorage;
 import io.grpc.Server;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
@@ -22,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.nio.file.Path;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
@@ -75,6 +79,18 @@ public final class WorkerBootstrap implements AutoCloseable {
      */
     public WorkerBootstrap(String workerId, String host, int rpcPort, int dataPort, int slots,
                            String etcdEndpoints) {
+        this(workerId, host, rpcPort, dataPort, slots, etcdEndpoints,
+                Path.of(env("CHECKPOINT_DIR", "build/checkpoints")));
+    }
+
+    /**
+     * Creates a worker with an explicit checkpoint directory.
+     *
+     * <p>In the compose deployment this is a shared mounted path (and becomes object storage in
+     * the RocksDB backend); keeping it explicit makes recovery tests use the same durable root.
+     */
+    public WorkerBootstrap(String workerId, String host, int rpcPort, int dataPort, int slots,
+                           String etcdEndpoints, Path checkpointRoot) {
         this.workerId = workerId;
         this.host = host;
         this.rpcPort = rpcPort;
@@ -82,7 +98,8 @@ public final class WorkerBootstrap implements AutoCloseable {
         this.slots = slots;
         this.metadata = new EtcdMetadataStore(etcdEndpoints);
         this.transportClient = new DataTransportClient(Subpartitions.DEFAULT_MAX_BUFFER_ELEMENTS);
-        this.taskManager = new TaskManager(workerId, host, dataPort, inputRegistry, transportClient);
+        this.taskManager = new TaskManager(workerId, host, dataPort, inputRegistry, transportClient,
+                checkpointRoot, checkpointStorage(checkpointRoot));
     }
 
     /**
@@ -132,15 +149,16 @@ public final class WorkerBootstrap implements AutoCloseable {
                 new RegisteredWorker(workerId, host, rpcPort, dataPort, slots), LEASE_TTL_SECONDS);
 
         taskManager.onTaskFailure(this::reportTaskFailure);
+        taskManager.onCheckpointAcknowledgement(this::acknowledgeCheckpoint);
 
-        heartbeat = new HeartbeatClient(workerId, "", masterAsync, taskManager);
+        heartbeat = new HeartbeatClient(workerId, masterAsync, taskManager);
         heartbeat.start();
 
         log.info("worker {} registered with the master at {}:{} and with etcd",
                 workerId, masterHost, masterPort);
     }
 
-    private void reportTaskFailure(String taskKey, Throwable failure) {
+    private void reportTaskFailure(String jobId, String taskKey, Throwable failure) {
         // Operator ids are user supplied and may legitimately contain '#'. The separator is
         // therefore the final one, immediately before the numeric subtask index.
         int separator = taskKey.lastIndexOf('#');
@@ -163,6 +181,7 @@ public final class WorkerBootstrap implements AutoCloseable {
             masterBlocking.reportTaskFailure(TaskFailure.newBuilder()
                     .setWorkerId(workerId)
                     .setTaskId(TaskId.newBuilder()
+                            .setJobId(jobId)
                             .setOperatorId(operatorId)
                             .setSubtaskIndex(subtaskIndex))
                     .setMessage(failure.getClass().getSimpleName() + ": " + failure.getMessage())
@@ -170,6 +189,19 @@ public final class WorkerBootstrap implements AutoCloseable {
                     .build());
         } catch (Exception e) {
             log.error("could not report the failure of {} to the master", taskKey, e);
+        }
+    }
+
+    private void acknowledgeCheckpoint(dev.dhruv.streaming.rpc.CheckpointAck acknowledgement) {
+        try {
+            masterBlocking.acknowledgeCheckpoint(acknowledgement);
+        } catch (Exception e) {
+            // The coordinator persists only a fully acknowledged checkpoint. If the master is
+            // temporarily unavailable this acknowledgement is lost and that checkpoint times
+            // out; a later checkpoint will produce a fresh, complete cut.
+            log.warn("could not acknowledge checkpoint {} for {}#{}",
+                    acknowledgement.getCheckpointId(), acknowledgement.getTaskId().getOperatorId(),
+                    acknowledgement.getTaskId().getSubtaskIndex(), e);
         }
     }
 
@@ -248,5 +280,21 @@ public final class WorkerBootstrap implements AutoCloseable {
     private static String env(String name, String fallback) {
         String value = System.getenv(name);
         return value == null || value.isBlank() ? fallback : value;
+    }
+
+    /**
+     * Uses MinIO whenever an endpoint is configured; a ZIP-based filesystem store remains the
+     * intentional default for tests and single-process development. The two implementations have
+     * identical materialization semantics, so recovery never relies on a shared worker disk.
+     */
+    private static CheckpointStorage checkpointStorage(Path checkpointRoot) {
+        String endpoint = System.getenv("MINIO_ENDPOINT");
+        if (endpoint == null || endpoint.isBlank()) {
+            return new FileSystemCheckpointStorage(checkpointRoot.resolve("archives"));
+        }
+        return new MinioCheckpointStorage(endpoint,
+                env("MINIO_ACCESS_KEY", "minioadmin"),
+                env("MINIO_SECRET_KEY", "minioadmin"),
+                env("MINIO_BUCKET", "stream-checkpoints"));
     }
 }

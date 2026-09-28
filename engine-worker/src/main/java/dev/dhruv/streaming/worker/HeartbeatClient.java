@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Tells the master this worker is alive, once a second, and listens for what it says back.
@@ -44,19 +45,18 @@ final class HeartbeatClient implements AutoCloseable {
     static final Duration INTERVAL = Duration.ofSeconds(1);
 
     private final String workerId;
-    private final String jobId;
     private final MasterServiceGrpc.MasterServiceStub master;
     private final TaskManager taskManager;
     private final ScheduledExecutorService scheduler;
 
-    private StreamObserver<WorkerBeat> beats;
+    private volatile StreamObserver<WorkerBeat> beats;
+    private final AtomicBoolean reconnectScheduled = new AtomicBoolean();
+    private volatile boolean closed;
 
     HeartbeatClient(String workerId,
-                    String jobId,
                     MasterServiceGrpc.MasterServiceStub master,
                     TaskManager taskManager) {
         this.workerId = workerId;
-        this.jobId = jobId;
         this.master = master;
         this.taskManager = taskManager;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -70,6 +70,15 @@ final class HeartbeatClient implements AutoCloseable {
      * Opens the stream and starts beating.
      */
     void start() {
+        openStream();
+        scheduler.scheduleAtFixedRate(this::beat, 0, INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+        log.info("heartbeating to the master every {}ms", INTERVAL.toMillis());
+    }
+
+    private void openStream() {
+        if (closed) {
+            return;
+        }
         beats = master.heartbeat(new StreamObserver<>() {
             @Override
             public void onNext(MasterCommand command) {
@@ -83,20 +92,33 @@ final class HeartbeatClient implements AutoCloseable {
                 // master could still make use of. Losing coordination is not losing work --
                 // which is exactly what Demo 2 in Phase 7 sets out to show.
                 log.warn("lost the heartbeat stream to the master: {}", error.getMessage());
+                beats = null;
+                scheduleReconnect();
             }
 
             @Override
             public void onCompleted() {
-                log.info("the master closed the heartbeat stream");
+                log.info("the master closed the heartbeat stream; reconnecting");
+                beats = null;
+                scheduleReconnect();
             }
         });
+        reconnectScheduled.set(false);
+    }
 
-        scheduler.scheduleAtFixedRate(this::beat, 0, INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
-        log.info("heartbeating to the master every {}ms", INTERVAL.toMillis());
+    private void scheduleReconnect() {
+        if (!closed && reconnectScheduled.compareAndSet(false, true)) {
+            scheduler.schedule(this::openStream, INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+        }
     }
 
     private void beat() {
         try {
+            StreamObserver<WorkerBeat> stream = beats;
+            if (stream == null) {
+                scheduleReconnect();
+                return;
+            }
             WorkerBeat.Builder builder = WorkerBeat.newBuilder().setWorkerId(workerId);
 
             long totalRecords = 0;
@@ -104,21 +126,28 @@ final class HeartbeatClient implements AutoCloseable {
                 totalRecords += task.recordsIn();
                 builder.addTasks(TaskStatus.newBuilder()
                         .setTaskId(TaskId.newBuilder()
-                                .setJobId(jobId)
+                                .setJobId(task.jobId())
                                 .setOperatorId(task.operatorId())
                                 .setSubtaskIndex(task.subtaskIndex()))
-                        .setState(task.isAlive() ? TaskState.TASK_RUNNING : TaskState.TASK_FINISHED)
+                        .setState(task.isFinished()
+                                ? TaskState.TASK_FINISHED : TaskState.TASK_RUNNING)
                         .setRecordsIn(task.recordsIn())
                         .setRecordsOut(task.recordsOut())
+                        .setLastCheckpointId(task.lastCheckpointId())
+                        .setLastCheckpointDurationMillis(task.lastCheckpointDurationMillis())
+                        .setLastCheckpointStateBytes(task.lastCheckpointStateBytes())
+                        .setLastAlignmentMillis(task.lastAlignmentMillis())
                         .build());
             }
 
             builder.setRecordsProcessed(totalRecords);
-            beats.onNext(builder.build());
+            stream.onNext(builder.build());
         } catch (Exception e) {
             // A failed beat is not worth failing the worker over. If the master really is gone,
             // it will stop hearing from this worker, which is the same signal either way.
             log.debug("a heartbeat could not be sent", e);
+            beats = null;
+            scheduleReconnect();
         }
     }
 
@@ -144,6 +173,7 @@ final class HeartbeatClient implements AutoCloseable {
 
     @Override
     public void close() {
+        closed = true;
         scheduler.shutdownNow();
         if (beats != null) {
             try {

@@ -71,7 +71,12 @@ export JOB_CLASSPATH
 echo "starting master on :7000"
 # The master needs the job's classes too: it deserializes the submitted graph in order to
 # compile it, and that graph holds the user's own operators.
-MASTER_PORT=7000 ETCD_ENDPOINTS=http://localhost:2379 JOB_CLASSPATH="$JOB_CLASSPATH" \
+MASTER_PORT=7000 ETCD_ENDPOINTS=http://localhost:2379 \
+  CHECKPOINT_INTERVAL_MS="${CHECKPOINT_INTERVAL_MS:-10000}" \
+  CHECKPOINT_TIMEOUT_MS="${CHECKPOINT_TIMEOUT_MS:-30000}" \
+  RESTART_MAX_ATTEMPTS="${RESTART_MAX_ATTEMPTS:-3}" \
+  RESTART_DELAY_MS="${RESTART_DELAY_MS:-1000}" \
+  JOB_CLASSPATH="$JOB_CLASSPATH" \
   "$ROOT/engine-master/build/install/engine-master/bin/engine-master" \
   > "$LOGS/master.log" 2>&1 &
 echo $! >> "$PIDS"
@@ -89,6 +94,10 @@ for i in 1 2 3; do
   MASTER_HOST=localhost \
   MASTER_PORT=7000 \
   ETCD_ENDPOINTS=http://localhost:2379 \
+  MINIO_ENDPOINT=http://localhost:9000 \
+  MINIO_ACCESS_KEY=minioadmin \
+  MINIO_SECRET_KEY=minioadmin \
+  MINIO_BUCKET=stream-checkpoints \
   JOB_CLASSPATH="$JOB_CLASSPATH" \
     "$ROOT/engine-worker/build/install/engine-worker/bin/engine-worker" \
     > "$LOGS/worker-$i.log" 2>&1 &

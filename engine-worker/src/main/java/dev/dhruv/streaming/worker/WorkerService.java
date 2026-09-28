@@ -53,31 +53,40 @@ final class WorkerService extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public void triggerCheckpoint(CheckpointTrigger trigger, StreamObserver<Empty> response) {
-        // Phase 4. The coordinator will call this on source tasks only; the source injects a
-        // barrier into its output and the barrier does the rest of the work by travelling.
-        log.warn("checkpoint {} requested, but checkpointing arrives in Phase 4",
-                trigger.getCheckpointId());
+        try {
+            // The coordinator invokes this only on workers with source tasks. SourceTask writes
+            // its next input position, forwards the marker in band, then sends its ack.
+            taskManager.triggerCheckpoint(trigger);
+            response.onNext(Empty.getDefaultInstance());
+            response.onCompleted();
+        } catch (Exception e) {
+            log.error("could not trigger checkpoint {}", trigger.getCheckpointId(), e);
+            response.onError(e);
+        }
+    }
+
+    @Override
+    public void notifyCheckpointComplete(CheckpointId id, StreamObserver<Empty> response) {
+        // Phase 6 gives sinks a transactional commit hook. It is intentionally a no-op for the
+        // Phase 4 console sink, but accepting it now keeps checkpoint completion ordered.
+        log.debug("checkpoint {} completed on this worker", id.getCheckpointId());
         response.onNext(Empty.getDefaultInstance());
         response.onCompleted();
     }
 
     @Override
-    public void notifyCheckpointComplete(CheckpointId id, StreamObserver<Empty> response) {
-        // Phase 4 delivers this to sinks, where in Phase 6 it becomes the commit half of
-        // two-phase commit against Iceberg.
-        log.warn("checkpoint {} completion notified, but checkpointing arrives in Phase 4",
-                id.getCheckpointId());
+    public void abortCheckpoint(CheckpointId id, StreamObserver<Empty> response) {
+        taskManager.abortCheckpoint(id.getJobId(), id.getCheckpointId());
         response.onNext(Empty.getDefaultInstance());
         response.onCompleted();
     }
 
     @Override
     public void restoreTask(RestoreRequest request, StreamObserver<Empty> response) {
-        // Phase 4. A task will be redeployed with a state handle and restore from it before
-        // processing anything.
-        log.warn("restore requested for {}, but recovery arrives in Phase 4",
-                request.getTaskId().getOperatorId());
-        response.onNext(Empty.getDefaultInstance());
-        response.onCompleted();
+        // A state handle is applied from TaskDeployment before its thread starts. Restoring an
+        // already-running task would splice a checkpoint into a live input stream, so recovery
+        // redeploys the whole job instead of using this legacy RPC as an in-place mutation.
+        response.onError(new IllegalStateException("restore is applied on redeployment via "
+                + "TaskDeployment.state_handle_uri, not to a running task"));
     }
 }

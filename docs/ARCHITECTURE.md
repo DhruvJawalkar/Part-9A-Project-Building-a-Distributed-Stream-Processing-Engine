@@ -38,13 +38,16 @@ The target shape, from §4.1 of the companion PDF:
                                                        +----------------+
 ```
 
-**As of Phase 3 the control and data planes are real.** A master process serves `MasterService` on :7000;
+**As of Phase 4 the control, data and checkpoint paths are real.** A master process serves
+`MasterService` on :7000;
 three worker processes serve `WorkerService` and `DataTransportService` on separate ports and
 register in etcd under a TTL lease. Records cross process boundaries over gRPC with credit-based
 flow control. Source tasks now generate event-time watermarks and in-band idle/active status;
-operator tasks advance their local clock from the minimum across active input channels. What is
-still missing from the diagram is everything downstream of a checkpoint: MinIO, the Iceberg
-warehouse, and the coordinator that would write to them.
+operator tasks advance their local clock from the minimum across active input channels. The master
+injects source barriers and receives task checkpoint acknowledgements. Workers archive full task
+snapshots in MinIO, while etcd stores the pointer and per-task handles only after the whole
+checkpoint completes. The Iceberg warehouse and transactional sink remain Phase 6 work; MinIO is
+currently used for checkpoint archives.
 
 `LocalJobExecutor` remains, and is still the right tool for tests and demos -- a determinism test
 comparing two runs of one fixture does not get more convincing by involving three processes.
@@ -82,10 +85,10 @@ is distributed round-robin:
 
 ---
 
-## Phase 3 event-time and keyed-state flow
+## Event-time and keyed-state flow
 
 The event-time path is deliberately a data-plane extension, not a separate scheduler. Records,
-watermark claims, idleness transitions, and eventually checkpoint barriers all use the same
+watermark claims, idleness transitions, and checkpoint barriers all use the same
 ordered channel. That gives every task one answer to “what happened before this marker?”
 
 ```text
@@ -103,7 +106,7 @@ SourceTask -- StreamRecord --> ResultPartitionWriter -- HASH/key group --> Opera
                                                                          min(active channels)
                                                                                 |
                                                                                 v
-                                                  InMemoryStateBackend <- current key -> TimerService
+                                                   RocksDbStateBackend <- current key -> TimerService
                                                                                 |
                                                                                 v
                                                                     SessionAggregator callback
@@ -124,6 +127,93 @@ it makes a bad selector deployment fail instead of silently splitting a key’s 
 
 ---
 
+## Phase 4 checkpoint and recovery flow
+
+Checkpoint barriers are `StreamElement`s, so each network channel preserves their order relative to
+records. The coordinator never snapshots downstream tasks directly; it triggers sources and lets
+the barrier mark the cut through the DAG:
+
+```text
+JobMaster / CheckpointCoordinator
+        | TriggerCheckpoint (source tasks only)
+        v
+KafkaSource -> source snapshot + barrier -> ordered record channels
+                                              |
+                         +--------------------+-------------------+
+                         v                                        v
+                multi-input task                         single-input task
+                block arrived channel                    snapshot directly
+                read remaining channels                  forward barrier
+                snapshot after all barriers              acknowledge
+                forward -> acknowledge                   continue
+                         |                                        |
+                         +--------------- task acks -------------+
+                                              |
+                                  all tasks acknowledged?
+                                              |
+                               write completed pointer to etcd
+                                              |
+                         notify completion / future sink commit
+```
+
+For multi-input tasks, `BarrierAligner` blocks the channel that has delivered its barrier and keeps
+consuming channels that have not. After all barriers for the same checkpoint arrive, the runtime
+takes its snapshot, forwards the barrier, acknowledges to the master, and releases the blocked
+channels. This explicit ordering prevents buffered post-barrier records from passing the barrier
+downstream or entering the snapshot. If the coordinator times out, `AbortCheckpoint` releases any
+channels held by the abandoned alignment.
+
+Each operator task stores keyed state in RocksDB. Its archive contains the RocksDB checkpoint and
+an envelope for pending timers and watermark progress. Each source archive contains connector
+position and watermark-generator progress. Kafka's manual partition assignment snapshots the next
+offset per partition without committing it to Kafka. Restore seeks to that position before source
+polling starts.
+
+Workers publish complete task directories through the `CheckpointStorage` interface. Production
+cluster configuration selects `MinioCheckpointStorage`; it uploads a ZIP to the configured bucket
+and returns a `minio://` handle. State handles nested inside the archive are relative paths. During
+restore, the assigned worker fetches and extracts the archive to its local checkpoint root, making
+the handle independent of the original worker's disk. Tests can use the filesystem implementation.
+
+The coordinator holds acknowledgements in memory until every physical chain-group task reports a
+handle. Then it persists the complete set to etcd before notifying workers of completion. An
+incomplete checkpoint times out, is never selected for recovery, and sends an abort command. Worker
+heartbeats include per-task checkpoint id, duration, state bytes, and alignment milliseconds.
+
+Recovery always rewinds the whole DAG. The master cancels and joins each running task, reads the
+latest completed pointer, then sends every task its matching state handle during redeployment. It
+quarantines a dead worker until a fresh registration, preventing recovery from assigning tasks to
+a stale etcd lease. The default restart policy waits one second and allows three attempts before
+marking the job failed.
+
+Heartbeat clients reconnect after a master outage. A surviving worker's first beat seeds the
+replacement master's failure detector, and task-status samples repopulate its latest-status
+registry. A bounded job transitions to `FINISHED` only when every task in the recovered physical
+plan reports completion.
+
+### Verified recovery run
+
+`DistributedCheckpointRecoveryIT` is the automated process-level acceptance test, run with
+`./gradlew :lms-job:integrationTest`. Testcontainers provides etcd and MinIO, and the test starts
+a real master plus three worker child JVMs. The five-task bounded job completes a checkpoint with
+zero bytes emitted by the sink. It force-kills the session owner chosen by `KeyGroupAssigner`,
+verifies task reassignment excludes the dead worker, waits for `FINISHED`, and compares the output
+byte for byte with a clean baseline.
+
+The three-worker run had 10 tasks. Five checkpoints completed with 10 task handles each in etcd
+and MinIO. Killing worker-2 caused detection after three missed heartbeats (about 3.47 seconds); the
+master recorded `clicks:1`, `sessions:0`, and `sessions:3` as lost, cancelled the whole job, and
+restarted from checkpoint 5 on worker-1 and worker-3. The replacement assignments excluded
+worker-2, and checkpoint 6 onward completed with all 10 handles. The `minio://` handles contained
+source-position properties and operator snapshots.
+
+The separate live Kafka run verifies recovery for the full 10-task LMS plan and MinIO checkpoint
+wiring. The fixed-replay `SessionPipelineRecoveryAcceptanceTest` and MinIO cross-filesystem test
+provide additional focused coverage, including restore after deleting the producer's local
+checkpoint directory.
+
+---
+
 ## Component table
 
 | Component | Lives in | Responsibility | Phase |
@@ -133,15 +223,15 @@ it makes a bad selector deployment fail instead of silently splitting a key’s 
 | `JobGraph` + `DataStream` / `KeyedStream` | engine-api | The logical graph and the builder that produces it. Validated on construction, not in the builder | 1 |
 | `KeyGroupAssigner` | engine-api | `key → key group → subtask`. The indirection that lets parallelism change without rehashing state | 1 |
 | `StateBackend` / `ValueState` / `ListState` | engine-api | Keyed state, narrow enough that heap and RocksDB are interchangeable | 1 (interfaces) |
-| `OperatorTask` | engine-runtime | The run loop. Restores keyed context, advances watermarks/timers, waits for every EOF; barrier alignment remains planned | 1–3 |
-| `SourceTask` | engine-runtime | Polls a source, assigns event time, emits watermarks and idle/active transitions; pull-based backpressure reaches the broker | 1–3 |
+| `OperatorTask` | engine-runtime | Restores keyed context, advances watermarks/timers, aligns multi-input barriers, snapshots and forwards before ack | 1–4 |
+| `SourceTask` | engine-runtime | Polls a source, assigns event time, checkpoints connector position and emits watermarks/barriers | 1–4 |
 | `ResultPartitionWriter` | engine-runtime | Routes FORWARD/REBALANCE/BROADCAST/HASH records and broadcasts control elements only down channels it actually feeds | 1–3 |
 | `InputGate` | engine-runtime | One bounded queue per input channel. Reports which channel an element came from, and can block one without blocking the task | 2 |
 | `OperatorChain` | engine-runtime | Fuses adjacent operators into one thread, exchanging records by method call | 2 |
 | `UserCodeClassLoader` | engine-runtime | Loads the job classes the engine was never compiled against | 2 |
 | `TaskInstances` | engine-runtime | Gives each subtask a private copy of its operator, by serialization | 1 |
 | `LocalJobExecutor` | engine-runtime | Single-JVM execution: a thread and a bounded queue per subtask | 1 |
-| `KafkaSource` | engine-connectors | Reads JSON from Kafka. Kafka owns offsets until planned Phase 4 takes them into checkpoints | 1 |
+| `KafkaSource` | engine-connectors | Manual partition ownership; snapshots next offsets and seeks to checkpointed positions on restore | 1, 4 |
 | `FileReplaySource` | engine-connectors | Bounded, deterministic JSON Lines replay partitioned by stable line hash | 3 |
 | `ConsoleSink` | engine-connectors | Prints. An `Operator<T, Void>` — sinks are not a separate concept | 1 |
 | `JobMaster` | engine-master | Owns the job state machine; persists every transition before acting on it | 2 |
@@ -158,10 +248,12 @@ it makes a bad selector deployment fail instead of silently splitting a key’s 
 | `WatermarkTracker` | engine-runtime | Per-channel watermarks and active/idle status; emits only a forward-moving minimum | 3 |
 | `BoundedOutOfOrdernessGenerator` | engine-runtime | Source watermark generation from max event time minus disorder, with idleness detection | 3 |
 | `TimerService` | engine-runtime | Deduplicated key/timestamp timers, fired in timestamp order with key context restored | 3 |
-| `InMemoryStateBackend` | engine-runtime | Heap-backed keyed value/list state; snapshots exist locally but coordinated checkpoint recovery is planned | 3 |
-| `CheckpointCoordinator` | engine-master | Triggers checkpoints, collects acks, notifies sinks | 4 |
-| `BarrierAligner` | engine-runtime | Chandy-Lamport alignment across input channels | 4 |
-| `RocksDbStateBackend` | engine-runtime | Embedded state, snapshotted to MinIO | 4 |
+| `InMemoryStateBackend` | engine-runtime | Heap-backed keyed value/list state for local execution and tests | 3 |
+| `CheckpointCoordinator` | engine-master | Periodic trigger, all-task ack collection, etcd completion pointer, timeout/abort, completion notification | 4 |
+| `BarrierAligner` | engine-runtime | Blocks arrived channels; snapshot → forward → ack → release, with abort support | 4 |
+| `RocksDbStateBackend` | engine-runtime | Keyed value/list state and RocksDB snapshots for task checkpoints | 4 |
+| `CheckpointStorage` | engine-worker | Archives/materializes full task checkpoints; filesystem and MinIO implementations | 4 |
+| `RestartStrategy` | engine-master | Fixed-delay job-wide restart attempts | 4 |
 | `IntervalJoinOperator` | engine-runtime | Two-sided buffering with watermark-driven eviction | 5 |
 | `IcebergSink` | engine-connectors | Two-phase commit against an Iceberg table | 6 |
 | `StatusApi` | engine-master | REST endpoints and Prometheus scrape | 7 |
@@ -230,6 +322,15 @@ the data it affects, and testable.
 **EOF requires every channel.** `Watermark.MAX` means a channel is complete, not that a task is
 complete. The task advances to MAX only after every input has ended, even if some inputs were
 previously idle.
+
+**A checkpoint is complete only as a whole.** The coordinator does not publish a recovery pointer
+until every physical task has acknowledged. Worker cancellation also joins the prior task thread
+before a restored task with the same identity may be deployed; otherwise both histories could
+emit after one checkpoint.
+
+**Checkpoint handles must outlive their worker.** Local RocksDB files are staging state only.
+Workers archive the whole task directory to shared object storage before acknowledging, and nested
+handles use paths relative to that archive. This lets a recovered task land on a different worker.
 
 ---
 

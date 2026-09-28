@@ -57,4 +57,26 @@ class TimerServiceTest {
         timers.advanceTo(101L, (timestamp, key) -> fired.add(key + "@" + timestamp));
         assertThat(fired).containsExactly("member@50");
     }
+
+    @Test
+    void snapshotAndRestorePreserveTheClockAndOnlyThePendingTimers() throws Exception {
+        TimerService original = new TimerService();
+        original.registerEventTimeTimer("already-fired", 10L);
+        original.registerEventTimeTimer("member-a", 20L);
+        original.registerEventTimeTimer("member-b", 30L);
+        original.advanceTo(10L, (timestamp, key) -> { });
+
+        TimerService restored = new TimerService();
+        restored.registerEventTimeTimer("discarded-on-restore", 5L);
+        restored.restore(original.snapshot());
+        List<String> fired = new ArrayList<>();
+
+        // The restored clock stays at 10, so replaying watermark 10 cannot duplicate work.
+        restored.advanceTo(10L, (timestamp, key) -> fired.add("unexpected"));
+        restored.advanceTo(30L, (timestamp, key) -> fired.add(key + "@" + timestamp));
+
+        assertThat(restored.currentWatermark()).isEqualTo(30L);
+        assertThat(fired).containsExactly("member-a@20", "member-b@30");
+        assertThat(restored.timerCount()).isZero();
+    }
 }

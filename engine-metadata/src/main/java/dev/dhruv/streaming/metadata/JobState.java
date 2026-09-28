@@ -6,12 +6,13 @@ package dev.dhruv.streaming.metadata;
  * <pre>
  *   CREATED --&gt; RUNNING --&gt; FINISHED
  *                  |
- *                  +------&gt; FAILING --&gt; FAILED
+ *                  +------&gt; FAILING --&gt; RESTARTING --&gt; RUNNING
+ *                                      \\--&gt; FAILED
  * </pre>
  *
- * <p>Phase 4 inserts {@code RESTARTING} between {@code FAILING} and {@code RUNNING}. Phase 2
- * has no checkpoint to recover to, so a failure here is terminal -- which is worth experiencing
- * before building the machinery that avoids it.
+ * <p>Phase 4 inserts {@code RESTARTING} between {@code FAILING} and {@code RUNNING}. The
+ * transition represents a whole-job rewind to the last completed checkpoint, never a patch to
+ * one surviving task.
  *
  * <p>Every transition is written to etcd <em>before</em> it is acted on. The ordering matters:
  * a master that cancelled tasks and then crashed before recording why would restart with no
@@ -32,7 +33,10 @@ public enum JobState {
     /** Something failed; tasks are being cancelled. */
     FAILING,
 
-    /** Terminal. Phase 4 replaces most paths here with a restart from the last checkpoint. */
+    /** Tasks were cancelled and the master is waiting to redeploy all of them from a checkpoint. */
+    RESTARTING,
+
+    /** Terminal: no recovery point or no restart attempt remained. */
     FAILED;
 
     /**

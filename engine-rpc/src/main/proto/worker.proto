@@ -15,6 +15,9 @@ service WorkerService {
   // Sources only. Barriers are injected at the head of the graph and flow with the records.
   rpc TriggerCheckpoint (CheckpointTrigger) returns (Empty);
 
+  // Releases any channels held by an incomplete alignment so a later checkpoint can proceed.
+  rpc AbortCheckpoint (CheckpointId) returns (Empty);
+
   // Sinks only. This is the commit signal of the engine's two-phase commit (Phase 6).
   rpc NotifyCheckpointComplete (CheckpointId) returns (Empty);
 
@@ -96,10 +99,14 @@ message DeployAck {
 message CheckpointTrigger {
   int64 checkpoint_id = 1;
   int64 trigger_ts = 2;
+  // One worker can host tasks from different jobs. A trigger therefore names the job whose
+  // source tasks alone may inject this barrier.
+  string job_id = 3;
 }
 
 message CheckpointId {
   int64 checkpoint_id = 1;
+  string job_id = 2;
 }
 
 message RestoreRequest {

@@ -5,4 +5,5 @@ dependencies {
     api(project(":engine-rpc"))
 
     implementation(libs.slf4j.api)
+    implementation(libs.rocksdb.jni)
 }

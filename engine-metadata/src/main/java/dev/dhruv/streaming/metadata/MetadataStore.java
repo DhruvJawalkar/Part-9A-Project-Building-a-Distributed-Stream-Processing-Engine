@@ -111,6 +111,26 @@ public interface MetadataStore extends AutoCloseable {
     Map<String, String> getAssignments(String jobId);
 
     /**
+     * Atomically replaces the job's recovery pointer with a fully completed checkpoint.
+     *
+     * <p>There is intentionally no operation for partial acknowledgements here. They belong to
+     * the coordinator's short-lived in-memory bookkeeping; making them durable would make it too
+     * easy for recovery to mistake an incomplete cut for a valid one.
+     *
+     * @param jobId job that owns the checkpoint
+     * @param checkpoint latest checkpoint that every task acknowledged
+     */
+    void putLatestCompletedCheckpoint(String jobId, CompletedCheckpoint checkpoint);
+
+    /**
+     * Returns the most recent job-wide checkpoint, if the job has ever completed one.
+     *
+     * @param jobId job to inspect
+     * @return the complete recovery point, never a partial checkpoint
+     */
+    Optional<CompletedCheckpoint> getLatestCompletedCheckpoint(String jobId);
+
+    /**
      * Lists the jobs this store knows about.
      *
      * @return job ids

@@ -100,7 +100,7 @@ final class MasterService extends MasterServiceGrpc.MasterServiceImplBase {
                 info.getWorkerId(), info.getHost(), info.getRpcPort(),
                 info.getDataPort(), info.getSlots());
 
-        jobMaster.taskTracker().workerRegistered(info.getWorkerId());
+        jobMaster.workerRegistered(info.getWorkerId());
 
         response.onNext(RegisterAck.newBuilder()
                 .setAccepted(true)
@@ -118,8 +118,12 @@ final class MasterService extends MasterServiceGrpc.MasterServiceImplBase {
             @Override
             public void onNext(WorkerBeat beat) {
                 workerId = beat.getWorkerId();
-                commandStreams.putIfAbsent(workerId, commands);
+                // A worker reconnecting after a master/network interruption replaces its old
+                // reply stream. Conditional removal below prevents the stale callback from
+                // deleting this new stream.
+                commandStreams.put(workerId, commands);
                 jobMaster.taskTracker().heartbeatReceived(workerId);
+                beat.getTasksList().forEach(jobMaster::onTaskStatus);
             }
 
             @Override
@@ -129,15 +133,16 @@ final class MasterService extends MasterServiceGrpc.MasterServiceImplBase {
                 // reconnected within the window is alive, and a worker that stopped beating is
                 // dead whether or not its stream reported an error.
                 log.debug("heartbeat stream from {} failed: {}", workerId, error.getMessage());
-                commandStreams.remove(workerId);
+                if (workerId != null) {
+                    commandStreams.remove(workerId, commands);
+                }
             }
 
             @Override
             public void onCompleted() {
                 // A clean goodbye: the worker is shutting down on purpose.
                 log.info("worker {} closed its heartbeat stream", workerId);
-                commandStreams.remove(workerId);
-                if (workerId != null) {
+                if (workerId != null && commandStreams.remove(workerId, commands)) {
                     jobMaster.taskTracker().workerDeregistered(workerId);
                 }
                 commands.onCompleted();
@@ -147,12 +152,15 @@ final class MasterService extends MasterServiceGrpc.MasterServiceImplBase {
 
     @Override
     public void acknowledgeCheckpoint(CheckpointAck ack, StreamObserver<Empty> response) {
-        // Phase 4. The coordinator collects these and completes a checkpoint once every task
-        // has acknowledged.
         log.debug("checkpoint ack from {} for checkpoint {}",
                 ack.getWorkerId(), ack.getCheckpointId());
-        response.onNext(Empty.getDefaultInstance());
-        response.onCompleted();
+        try {
+            jobMaster.acknowledgeCheckpoint(ack);
+            response.onNext(Empty.getDefaultInstance());
+            response.onCompleted();
+        } catch (RuntimeException failure) {
+            response.onError(failure);
+        }
     }
 
     @Override

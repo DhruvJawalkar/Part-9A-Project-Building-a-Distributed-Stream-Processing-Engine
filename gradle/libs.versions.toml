@@ -17,6 +17,8 @@ protobufPlugin = "0.10.0"
 # engines that no longer accept the 1.32 API used by 1.20.x.
 testcontainers = "1.21.4"
 awaitility = "4.3.0"
+rocksdb = "9.10.0"
+minio = "8.5.17"
 
 [libraries]
 junit-bom      = { module = "org.junit:junit-bom",                version.ref = "junit" }
@@ -45,6 +47,13 @@ testcontainers-junit = { module = "org.testcontainers:junit-jupiter", version.re
 testcontainers-kafka = { module = "org.testcontainers:kafka",  version.ref = "testcontainers" }
 # Polling with a deadline, for tests of things that become true rather than are true.
 awaitility         = { module = "org.awaitility:awaitility",   version.ref = "awaitility" }
+
+# Phase 4: an embedded LSM keeps keyed state off the Java heap and provides atomic local
+# checkpoints. The runtime deliberately exposes it only behind StateBackend.
+rocksdb-jni        = { module = "org.rocksdb:rocksdbjni",       version.ref = "rocksdb" }
+# Phase 4: durable, worker-independent checkpoint archives. MinIO exposes the S3 API used by
+# the local compose environment as well as production-compatible object stores.
+minio              = { module = "io.minio:minio",                version.ref = "minio" }
 
 [plugins]
 protobuf = { id = "com.google.protobuf", version.ref = "protobufPlugin" }

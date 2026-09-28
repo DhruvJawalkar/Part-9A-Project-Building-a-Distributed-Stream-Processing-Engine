@@ -46,4 +46,19 @@ class BoundedOutOfOrdernessGeneratorTest {
 
         assertThat(generator.onPeriodicEmit()).isEmpty();
     }
+
+    @Test
+    void restoresEventTimeProgressSoRecoveryCanAdvanceExistingTimers() {
+        AtomicLong clock = new AtomicLong(1_000L);
+        BoundedOutOfOrdernessGenerator beforeFailure =
+                new BoundedOutOfOrdernessGenerator(25L, Long.MAX_VALUE, clock::get);
+        beforeFailure.onEvent(1_000L);
+        beforeFailure.onEvent(1_040L);
+
+        BoundedOutOfOrdernessGenerator recovered =
+                new BoundedOutOfOrdernessGenerator(25L, Long.MAX_VALUE, clock::get);
+        recovered.restore(beforeFailure.snapshot());
+
+        assertThat(recovered.onPeriodicEmit()).contains(new Watermark(1_015L));
+    }
 }

@@ -7,7 +7,7 @@ Every entry here was found by **running the thing**, not by a test failing. That
 keeping the log: the tests came second in each case, written to pin a bug that had already
 happened. Which bugs a design lets you make is worth knowing.
 
-**Status key:** `FIXED` — fixed and pinned by a test · `OPEN` — known, not yet addressed ·
+**Status key:** `FIXED` — fixed and pinned by a regression test or repeatable runtime check · `OPEN` — known, not yet addressed ·
 `ACCEPTED` — understood, deliberately not fixed, with a reason.
 
 ---
@@ -26,10 +26,13 @@ happened. Which bugs a design lets you make is worth knowing.
 | [8](#8-an-idle-channel-could-make-max-look-safe) | 3 | An idle channel could make MAX look safe | FIXED | Yes |
 | [9](#9-keyed-state-crossed-an-operator-chain-boundary) | 3 | Keyed state crossed an operator-chain boundary | FIXED | Yes |
 | [10](#10-session-windows-merged-events-across-a-real-gap) | 3 | Session windows merged events across a real gap | FIXED | Yes |
+| [11](#11-windows-line-endings-blocked-the-git-bash-cluster-script) | 4 | Windows line endings blocked the Git Bash cluster script | FIXED | No |
+| [12](#12-kafka-interrupt-during-worker-cancellation-looked-like-task-failure) | 4 | Kafka interrupt during worker cancellation looked like task failure | FIXED | No |
+| [13](#13-scheduled-flush-held-a-monitor-during-credit-wait) | 4 | Scheduled flush held a monitor during credit wait | FIXED | No |
 
 ### The pattern worth noticing
 
-**Eight of ten produced no error at all.** No exception, no failed health check, no red log line
+**Eight of the first ten produced no error at all.** No exception, no failed health check, no red log line
 — just a job that was up, reported as `RUNNING`, and quietly not doing its work. The Phase 3
 entries are the classic forms: a window that never closes, a window that closes too early, or
 state attached to the wrong operator. All can look like an ordinary data-quality issue.
@@ -38,6 +41,9 @@ That is the characteristic failure mode of a distributed stream processor, and i
 shape as Demo 4 in Phase 7: *it fails while looking entirely healthy*. Worth remembering when
 writing the article — these are not embarrassments to hide, they are the argument for why the
 mechanisms exist.
+
+The Phase 4 run issues below were operationally visible: one prevented cluster startup from the
+shell, and two could stall or confuse task cancellation during recovery.
 
 ---
 
@@ -275,24 +281,84 @@ the current open session is counted/dropped. There is no allowed-lateness reopen
 
 ---
 
+## 11. Windows line endings blocked the Git Bash cluster script
+
+**Phase 4 · FIXED · visible**
+
+The cluster launcher was checked out with Windows CRLF line endings. Git Bash treated the carriage
+return at the end of the shebang as part of the interpreter path, so invoking the script failed
+before it could start the master or workers. The source looked normal in an editor, making the
+failure easy to misattribute to Docker or the Java launch command.
+
+**The rule:** shell entry points that are launched from Git Bash need Unix line endings in the
+working tree. The tracked script now has LF endings; the fix was verified by starting the cluster
+script and observing the worker processes register.
+
+- **Fix:** normalize `demos/run-cluster.sh` to LF in the repository.
+- **Verification:** the Phase 4 three-worker recovery run started through this script.
+
+---
+
+## 12. Kafka interrupt during worker cancellation looked like task failure
+
+**Phase 4 · FIXED · visible**
+
+During whole-job recovery, the master intentionally cancels every task. Interrupting a worker's
+Kafka poll can surface as Kafka's `InterruptException` rather than a plain `InterruptedException`.
+If the source reports that connector exception after cancellation, the worker sends a task-failure
+report for work the master itself just stopped. That can race with recovery and make normal
+cancellation look like a new failure.
+
+**The rule:** after cancellation fences a source task, connector exceptions from its active poll
+are part of shutdown. Exceptions while the task is still running remain genuine failures.
+
+- **Fix:** `SourceTask.run` checks its `running` flag in the general exception path and reports
+  connector failures only while the task is still active.
+- **Test:** `SourceTaskCheckpointTest.connectorWakeupDuringCancellationIsNotReportedAsATaskFailure`
+  interrupts a connector poll after cancellation and verifies that no failure is reported.
+
+## 13. Scheduled flush held a monitor during credit wait
+
+**Phase 4 · FIXED · visible**
+
+`RemoteSubpartition` schedules buffer flushes on a timer thread. A flush held the subpartition
+monitor while waiting up to 120 seconds for downstream credit. During recovery, task cancellation
+then tried to close the same output and could not publish closure or finish teardown until that
+credit wait returned. The old task thread stayed alive, so the master could not safely redeploy its
+replacement.
+
+**The rule:** a close or cancellation path must be able to interrupt a producer waiting for credit,
+make closure visible, and release the waiter before waiting for the task thread to stop. A delayed
+flush must recheck the closed state after waking so it cannot publish a buffer after shutdown.
+
+- **Fix:** cancel the scheduled flush with interruption (`cancel(true)`); close publishes the
+  closed state, releases the credit waiter, and rechecks closure after acquiring the monitor. If a
+  deployment fails partway through, rollback also cancels the tasks already accepted so no
+  orphaned partial execution remains.
+- **Verification:** `DistributedCheckpointRecoveryIT` kills a session-owning worker, completes
+  cancellation and redeployment without waiting for the credit timeout, excludes the dead worker,
+  and reaches `FINISHED` with output equal to the clean baseline.
+
+---
+
 ## Review notes
 
-Things noticed while fixing the above that are not bugs yet, but should be looked at when the log
-is reviewed.
+Remaining review notes and resolved Phase 4 follow-ups.
 
-**R1 — source-chain event-time callbacks need end-to-end coverage.** `ChainedSourceOutput` now
-passes an active watermark through its fused operators before forwarding it. That closes the
-Phase 2 timestamp gap in the code path, but a distributed source-chain/session test would make
-the proof stronger than the current local task-loop coverage.
+**R1 — source-chain event-time callbacks. RESOLVED in Phase 4.** `ChainedSourceOutput` passes
+watermarks through fused operators before forwarding. `DistributedCheckpointRecoveryIT` exercises
+the source/filter/session pipeline through the real worker child JVMs and verifies the recovered
+output against a clean baseline, covering the distributed source path.
 
 **R2 — `InputGate.onChannelDrained` is wired but unused.** Credit is granted from the gRPC handler
 after a whole buffer lands, not per element consumed. The hook exists for a more precise scheme.
-Decide in Phase 4 whether alignment makes the finer granularity worth having, or remove it.
+Phase 4 alignment and bounded channel queues work with the current buffer-level credit model.
+Revisit only if a measured backpressure or alignment issue justifies per-element credit renewal.
 
 **R3 — Task identity parsing was corrected, but has no focused test.** `WorkerBootstrap` now
 splits the final `#` from `operatorId#subtaskIndex`, so a user-supplied operator id may itself
-contain `#`. Add a focused worker failure-reporting test when the Phase 4 recovery test harness
-exists.
+contain `#`. The Phase 4 recovery harness exists, but it does not assert this unusual-id case;
+keep a focused worker failure-reporting test on the follow-up list.
 
 **R4 — `TaskTracker` cannot distinguish a dead worker from an unreachable one.** Not fixable —
 this is the failure detector problem — but the *consequence* changes by phase. In Phase 2 a

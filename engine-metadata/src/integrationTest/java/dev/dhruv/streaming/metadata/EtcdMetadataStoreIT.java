@@ -132,6 +132,21 @@ class EtcdMetadataStoreIT {
 
     @Test
     @Timeout(30)
+    @DisplayName("persists the latest complete checkpoint and every task handle")
+    void persistsLatestCompleteCheckpoint() {
+        CompletedCheckpoint checkpoint = new CompletedCheckpoint(7, 123456789L, Map.of(
+                "clicks:0", new CompletedCheckpoint.TaskState("file:///state/clicks-0", 42, 3),
+                "sessions:1", new CompletedCheckpoint.TaskState("s3://state/sessions-1", 99, 8)));
+
+        store.putLatestCompletedCheckpoint(jobId, checkpoint);
+        store.close();
+        store = new EtcdMetadataStore(endpoint);
+
+        assertThat(store.getLatestCompletedCheckpoint(jobId)).contains(checkpoint);
+    }
+
+    @Test
+    @Timeout(30)
     @DisplayName("a registered worker is visible to another client")
     void workerRegistrationIsVisible() {
         RegisteredWorker worker = worker("it-worker-" + UUID.randomUUID());
