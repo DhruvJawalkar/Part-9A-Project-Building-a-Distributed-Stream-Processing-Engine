@@ -123,9 +123,17 @@ record RunningTask(
         return inputGate.totalCapacity();
     }
 
-    /** A producer blocks only once every inbound channel is full. */
+    /** A producer blocks when its particular inbound channel is full. */
     boolean isBackpressured() {
-        return inputCapacity() > 0 && inputQueuedElements() >= inputCapacity();
+        return inputGate.hasFullChannel();
+    }
+
+    long currentWatermark() {
+        return switch (task) {
+            case SourceTask source -> source.currentWatermark();
+            case OperatorTask operator -> operator.currentWatermark();
+            default -> Long.MIN_VALUE;
+        };
     }
 
     boolean supportsSourceLag() {

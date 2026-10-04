@@ -7,6 +7,7 @@ import dev.dhruv.streaming.metadata.MetadataStore;
 import dev.dhruv.streaming.rpc.TaskStatus;
 import dev.dhruv.streaming.rpc.SourcePartitionLag;
 import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
 import io.micrometer.prometheus.PrometheusConfig;
@@ -20,9 +21,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Small, deliberately explicit HTTP view of the master. The control plane remains gRPC; this
@@ -35,7 +39,6 @@ public final class StatusApi implements AutoCloseable {
     private final HttpServer server;
     private final PrometheusMeterRegistry registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
     private final Map<String, TaskMeters> taskMeters = new ConcurrentHashMap<>();
-    private final Map<String, AtomicLong> sourceLagMeters = new ConcurrentHashMap<>();
 
     public StatusApi(int port, JobMaster jobs, MetadataStore metadata) throws IOException {
         if (port < 0 || port > 65_535) {
@@ -215,7 +218,8 @@ public final class StatusApi implements AutoCloseable {
                 + ",\"worker\":" + nullableQuote(workerId)
                 + ",\"state\":" + quote(status.getState().name())
                 + ",\"heartbeatReceived\":true"
-                + ",\"watermark\":null"
+                + ",\"watermark\":" + (status.hasCurrentWatermark()
+                        ? Long.toString(status.getCurrentWatermark()) : "null")
                 + ",\"recordsIn\":" + status.getRecordsIn()
                 + ",\"recordsOut\":" + status.getRecordsOut()
                 + ",\"lastCheckpointId\":" + status.getLastCheckpointId()
@@ -256,11 +260,17 @@ public final class StatusApi implements AutoCloseable {
         return Integer.parseInt(taskId.substring(taskId.lastIndexOf(':') + 1));
     }
 
-    private void refreshMeters() {
+    private synchronized void refreshMeters() {
+        Set<String> active = new HashSet<>();
         for (String jobId : metadata.listJobs()) {
+            if (metadata.getJobState(jobId).map(state -> state.isTerminal()).orElse(true)) {
+                continue;
+            }
             for (Map.Entry<String, TaskStatus> entry : jobs.taskStatuses(jobId).entrySet()) {
                 TaskStatus status = entry.getValue();
-                TaskMeters meters = taskMeters.computeIfAbsent(jobId + '\u0000' + entry.getKey(), ignored -> {
+                String identity = jobId + '\u0000' + entry.getKey();
+                active.add(identity);
+                TaskMeters meters = taskMeters.computeIfAbsent(identity, ignored -> {
                     TaskMeters created = new TaskMeters();
                     Tags tags = Tags.of("job", jobId, "operator", operatorId(entry.getKey()),
                             "subtask", Integer.toString(subtask(entry.getKey())));
@@ -269,6 +279,13 @@ public final class StatusApi implements AutoCloseable {
                     Gauge.builder("stream.engine.checkpoint.duration.milliseconds", created.checkpointDuration, AtomicLong::get).tags(tags).register(registry);
                     Gauge.builder("stream.engine.checkpoint.alignment.milliseconds", created.alignment, AtomicLong::get).tags(tags).register(registry);
                     Gauge.builder("stream.engine.state.size.bytes", created.stateBytes, AtomicLong::get).tags(tags).register(registry);
+                    Gauge.builder("stream.engine.current.watermark", created.watermark, AtomicReference::get)
+                            .tags(tags).register(registry);
+                    Gauge.builder("stream.engine.source.lag.records", created.sourceLag, AtomicReference::get)
+                            .tags(tags).register(registry);
+                    created.registered = registry.getMeters().stream()
+                            .filter(meter -> java.util.stream.StreamSupport.stream(tags.spliterator(), false).allMatch(tag ->
+                                    tag.getValue().equals(meter.getId().getTag(tag.getKey())))).toList();
                     return created;
                 });
                 meters.recordsIn.set(status.getRecordsIn());
@@ -276,19 +293,20 @@ public final class StatusApi implements AutoCloseable {
                 meters.checkpointDuration.set(status.getLastCheckpointDurationMillis());
                 meters.alignment.set(status.getLastAlignmentMillis());
                 meters.stateBytes.set(status.getLastCheckpointStateBytes());
-                if (status.getSourceLagAvailable()) {
-                    AtomicLong lag = sourceLagMeters.computeIfAbsent(jobId + '\u0000' + entry.getKey(), ignored -> {
-                        AtomicLong created = new AtomicLong();
-                        Tags tags = Tags.of("job", jobId, "operator", operatorId(entry.getKey()),
-                                "subtask", Integer.toString(subtask(entry.getKey())));
-                        Gauge.builder("stream.engine.source.lag.records", created, AtomicLong::get)
-                                .tags(tags).register(registry);
-                        return created;
-                    });
-                    lag.set(status.getSourceLagList().stream().mapToLong(SourcePartitionLag::getLagRecords).sum());
-                }
+                meters.watermark.set(status.hasCurrentWatermark()
+                        ? (double) status.getCurrentWatermark() : Double.NaN);
+                meters.sourceLag.set(status.getSourceLagAvailable()
+                        ? (double) status.getSourceLagList().stream()
+                                .mapToLong(SourcePartitionLag::getLagRecords).sum() : Double.NaN);
             }
         }
+        taskMeters.entrySet().removeIf(entry -> {
+            if (active.contains(entry.getKey())) {
+                return false;
+            }
+            entry.getValue().registered.forEach(registry::remove);
+            return true;
+        });
     }
 
     private static List<String> pathSegments(String path) {
@@ -338,5 +356,8 @@ public final class StatusApi implements AutoCloseable {
         private final AtomicLong checkpointDuration = new AtomicLong();
         private final AtomicLong alignment = new AtomicLong();
         private final AtomicLong stateBytes = new AtomicLong();
+        private final AtomicReference<Double> watermark = new AtomicReference<>(Double.NaN);
+        private final AtomicReference<Double> sourceLag = new AtomicReference<>(Double.NaN);
+        private List<Meter> registered = List.of();
     }
 }

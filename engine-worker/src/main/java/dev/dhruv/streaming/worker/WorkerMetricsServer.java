@@ -3,6 +3,7 @@ package dev.dhruv.streaming.worker;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
 import io.micrometer.prometheus.PrometheusConfig;
@@ -13,6 +14,9 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -68,9 +72,12 @@ final class WorkerMetricsServer implements AutoCloseable {
         }
     }
 
-    private void refresh() {
+    private synchronized void refresh() {
+        Set<String> active = new HashSet<>();
         for (RunningTask task : tasks.runningTasks().values()) {
-            TaskMeters current = meters.computeIfAbsent(task.taskKey(), ignored -> register(task));
+            String identity = task.jobId() + '\u0000' + task.taskKey();
+            active.add(identity);
+            TaskMeters current = meters.computeIfAbsent(identity, ignored -> register(task));
             current.recordsIn.set(task.recordsIn());
             current.recordsOut.set(task.recordsOut());
             current.queued.set(task.inputQueuedElements());
@@ -79,8 +86,18 @@ final class WorkerMetricsServer implements AutoCloseable {
             current.checkpointDuration.set(task.lastCheckpointDurationMillis());
             current.alignment.set(task.lastAlignmentMillis());
             current.stateBytes.set(task.lastCheckpointStateBytes());
-            task.sourceLag().ifPresent(lag -> current.sourceLagRecords.set((double) lag.totalLagRecords()));
+            current.watermark.set(task.currentWatermark() == Long.MIN_VALUE
+                    ? Double.NaN : (double) task.currentWatermark());
+            current.sourceLagRecords.set(task.sourceLag()
+                    .map(lag -> (double) lag.totalLagRecords()).orElse(Double.NaN));
         }
+        meters.entrySet().removeIf(entry -> {
+            if (active.contains(entry.getKey())) {
+                return false;
+            }
+            entry.getValue().registered.forEach(registry::remove);
+            return true;
+        });
     }
 
     private TaskMeters register(RunningTask task) {
@@ -95,11 +112,16 @@ final class WorkerMetricsServer implements AutoCloseable {
         Gauge.builder("stream.engine.checkpoint.duration.milliseconds", created.checkpointDuration, AtomicLong::get).tags(tags).register(registry);
         Gauge.builder("stream.engine.checkpoint.alignment.milliseconds", created.alignment, AtomicLong::get).tags(tags).register(registry);
         Gauge.builder("stream.engine.state.size.bytes", created.stateBytes, AtomicLong::get).tags(tags).register(registry);
+        Gauge.builder("stream.engine.current.watermark", created.watermark, AtomicReference::get)
+                .tags(tags).register(registry);
         if (task.supportsSourceLag()) {
             // NaN is Prometheus' explicit "not sampled yet", not a made-up zero during startup.
             Gauge.builder("stream.engine.source.lag.records", created.sourceLagRecords,
                     AtomicReference::get).tags(tags).register(registry);
         }
+        created.registered = registry.getMeters().stream()
+                .filter(meter -> java.util.stream.StreamSupport.stream(tags.spliterator(), false).allMatch(tag ->
+                        tag.getValue().equals(meter.getId().getTag(tag.getKey())))).toList();
         return created;
     }
 
@@ -119,5 +141,7 @@ final class WorkerMetricsServer implements AutoCloseable {
         private final AtomicLong alignment = new AtomicLong();
         private final AtomicLong stateBytes = new AtomicLong();
         private final AtomicReference<Double> sourceLagRecords = new AtomicReference<>(Double.NaN);
+        private final AtomicReference<Double> watermark = new AtomicReference<>(Double.NaN);
+        private List<Meter> registered = List.of();
     }
 }

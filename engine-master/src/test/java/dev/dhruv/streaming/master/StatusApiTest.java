@@ -85,9 +85,19 @@ class StatusApiTest {
         assertThat(get("/metrics").body()).contains("stream_engine_records_in_total", "17.0",
                 "stream_engine_source_lag_records", "9.0");
 
+        // A watermark at the epoch is established progress; protobuf absence must not conflate
+        // that legitimate zero with a task which has not processed its first watermark.
+        TaskStatus original = master.taskStatuses(graph.jobId()).get(taskKey);
+        master.onTaskStatus(original.toBuilder().setCurrentWatermark(0).build());
+        assertThat(get("/jobs/" + graph.jobId() + "/tasks").body()).contains("\"watermark\":0");
+        master.onTaskStatus(original.toBuilder().setCurrentWatermark(1234).build());
+        assertThat(get("/jobs/" + graph.jobId() + "/tasks").body()).contains("\"watermark\":1234");
+        assertThat(get("/metrics").body()).contains("stream_engine_current_watermark", "1234.0");
+
         HttpResponse<String> cancelled = request("POST", "/jobs/" + graph.jobId() + "/cancel");
         assertThat(cancelled.statusCode()).isEqualTo(202);
         assertThat(master.stateOf(graph.jobId())).contains(JobState.CANCELLED);
+        assertThat(get("/metrics").body()).doesNotContain("job=\"" + graph.jobId() + "\"");
         assertThat(request("POST", "/jobs").statusCode()).isEqualTo(405);
         assertThat(get("/jobs/missing").statusCode()).isEqualTo(404);
     }

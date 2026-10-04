@@ -56,6 +56,7 @@ public final class SourceTask implements Runnable {
 
     private volatile boolean running = true;
     private volatile boolean started;
+    private volatile long currentWatermark = Long.MIN_VALUE;
     private volatile Optional<StateHandle> restoreHandle = Optional.empty();
     private volatile long lastCheckpointId;
     private volatile long lastCheckpointDurationMillis;
@@ -148,6 +149,7 @@ public final class SourceTask implements Runnable {
                 // sessions unemitted. An unbounded source never reaches this.
                 log.info("source task {} reached end of stream", taskId);
                 output.broadcast(Watermark.MAX);
+                currentWatermark = Long.MAX_VALUE;
                 output.flush();
             }
         } catch (InterruptedException e) {
@@ -204,6 +206,11 @@ public final class SourceTask implements Runnable {
     /** Whether this source can ever report input lag. */
     public boolean supportsSourceLag() {
         return source instanceof SourceLagReporter;
+    }
+
+    /** Last emitted event-time progress, safely published to the control plane. */
+    public long currentWatermark() {
+        return currentWatermark;
     }
 
     /**
@@ -306,6 +313,7 @@ public final class SourceTask implements Runnable {
         Files.createDirectories(checkpointDir);
         Path envelope = checkpointDir.resolve("source-task-" + checkpointId + ".properties");
         Properties saved = new Properties();
+        saved.setProperty("watermark.emitted", Long.toString(currentWatermark));
         sourceHandle.ifPresent(handle -> {
             try {
                 saved.setProperty("source.handle.path", relativePath(checkpointDir, handle));
@@ -334,6 +342,8 @@ public final class SourceTask implements Runnable {
         try (Reader reader = Files.newBufferedReader(envelope)) {
             saved.load(reader);
         }
+        currentWatermark = Long.parseLong(saved.getProperty("watermark.emitted",
+                Long.toString(Long.MIN_VALUE)));
         String sourcePath = saved.getProperty("source.handle.path");
         if (sourcePath != null) {
             if (!(source instanceof CheckpointableSource<?> checkpointable)) {
@@ -481,6 +491,7 @@ public final class SourceTask implements Runnable {
             watermark.ifPresent(value -> {
                 try {
                     output.broadcast(value);
+                    currentWatermark = value.timestamp();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new TaskCancelledException("cancelled while emitting a watermark");

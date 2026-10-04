@@ -45,6 +45,7 @@ class OperatorTaskEventTimeTest {
         KeySelector<Event, String> selector = Event::key;
         OperatorTask task = new OperatorTask("keyed#0", new TimerOperator(), gate, output,
                 java.util.Optional.of(selector), new TaskMetricGroup("keyed", 0));
+        assertThat(task.currentWatermark()).isEqualTo(Long.MIN_VALUE);
 
         Thread thread = new Thread(task);
         thread.start();
@@ -58,6 +59,7 @@ class OperatorTaskEventTimeTest {
         assertThat(TIMER_RESULTS).containsExactly("member-1:saved");
         assertThat(WATERMARKS).containsExactly(10L, Long.MAX_VALUE);
         assertThat(output.elements.stream().filter(Watermark.class::isInstance)).hasSize(2);
+        assertThat(task.currentWatermark()).isEqualTo(Long.MAX_VALUE);
     }
 
     @Test

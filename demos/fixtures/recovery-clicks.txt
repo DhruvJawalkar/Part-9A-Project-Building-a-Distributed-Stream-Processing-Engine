@@ -1,0 +1,6 @@
+member-beta|book-1|first|SEARCH|18000
+bot-crawler|book-x|ignored|SEARCH|19000
+member-beta|book-1|second|RESULT_CLICK|20000
+member-beta|book-1|during-outage|RESULT_CLICK|21000
+member-beta|book-2|future|SEARCH|2000000
+bot-crawler|book-y|watermark|SEARCH|4000000

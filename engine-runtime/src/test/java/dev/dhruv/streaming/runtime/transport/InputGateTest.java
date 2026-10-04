@@ -26,6 +26,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 class InputGateTest {
 
     @Test
+    void reportsBackpressureWhenOnlyOneOfSeveralChannelsIsFull() throws Exception {
+        InputGate gate = new InputGate(3, 2, ignored -> { });
+        assertThat(gate.hasFullChannel()).isFalse();
+        gate.enqueue(1, new StreamRecord<>("first", 1));
+        assertThat(gate.hasFullChannel()).isFalse();
+        gate.enqueue(1, new StreamRecord<>("second", 2));
+        assertThat(gate.queuedElements()).isLessThan(gate.totalCapacity());
+        assertThat(gate.hasFullChannel()).isTrue();
+        gate.poll(0, TimeUnit.MILLISECONDS);
+        assertThat(gate.hasFullChannel()).isFalse();
+        assertThat(new InputGate(0).hasFullChannel()).isFalse();
+    }
+
+    @Test
     @Timeout(10)
     @DisplayName("reports which channel an element arrived on")
     void reportsTheChannel() throws Exception {

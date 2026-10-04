@@ -102,6 +102,7 @@ class OperatorTaskCheckpointTest {
         Thread firstThread = new Thread(first, "before-recovery");
         firstThread.start();
         firstGate.enqueue(0, new StreamRecord<>(new Event("member-1", "remembered"), 10));
+        firstGate.enqueue(0, new Watermark(11));
         firstGate.enqueue(0, new CheckpointBarrier(3, 11));
         assertThat(snapshotted.await(2, TimeUnit.SECONDS)).isTrue();
         first.cancel();
@@ -114,6 +115,8 @@ class OperatorTaskCheckpointTest {
         restored.restore(checkpoint.get().stateHandle());
         Thread restoredThread = new Thread(restored, "after-recovery");
         restoredThread.start();
+        org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2))
+                .until(() -> restored.currentWatermark() == 11L);
         restoredGate.enqueue(0, new Watermark(100));
         restoredGate.enqueue(0, Watermark.MAX);
         restoredThread.join(2_000);

@@ -106,6 +106,7 @@ public final class OperatorTask implements Runnable {
     private volatile long lastCheckpointDurationMillis;
     private volatile long lastCheckpointStateBytes;
     private volatile long lastAlignmentMillis;
+    private volatile long currentWatermark = Long.MIN_VALUE;
 
     private Consumer<CheckpointResult> checkpointListener = result -> {
     };
@@ -333,6 +334,7 @@ public final class OperatorTask implements Runnable {
         collector.setCurrentTimestamp(watermark.timestamp());
         operator.onWatermark(watermark.timestamp(), collector);
         output.broadcast(watermark);
+        currentWatermark = watermark.timestamp();
     }
 
     private void handleBarrier(CheckpointBarrier barrier, int channelIndex) throws Exception {
@@ -448,6 +450,7 @@ public final class OperatorTask implements Runnable {
                     snapshot.stateSizeBytes()));
             timerService.restore(snapshot.timerSnapshot());
             watermarkTracker.restore(snapshot.watermarkSnapshot());
+            currentWatermark = watermarkTracker.currentWatermark();
             restoredOperatorCheckpointState = snapshot.operatorCheckpointState();
             restoreOperatorCheckpointState = true;
             if (checkpointLifecycleEnabled() && snapshot.checkpointId() > 0) {
@@ -521,6 +524,11 @@ public final class OperatorTask implements Runnable {
      */
     public TaskMetricGroup metrics() {
         return metrics;
+    }
+
+    /** Last processed event-time progress, safely published to heartbeat and metrics threads. */
+    public long currentWatermark() {
+        return currentWatermark;
     }
 
     /**

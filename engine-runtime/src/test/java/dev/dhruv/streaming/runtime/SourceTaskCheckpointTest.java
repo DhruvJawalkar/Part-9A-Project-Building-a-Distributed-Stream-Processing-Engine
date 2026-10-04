@@ -47,6 +47,7 @@ class SourceTaskCheckpointTest {
             result.set(checkpoint);
             acknowledged.countDown();
         });
+        assertThat(task.currentWatermark()).isEqualTo(Long.MIN_VALUE);
 
         Thread taskThread = new Thread(task, "source-checkpoint-test");
         taskThread.start();
@@ -55,6 +56,7 @@ class SourceTaskCheckpointTest {
         task.triggerCheckpoint(new CheckpointBarrier(7, 123L), temporaryDirectory.resolve("checkpoint"));
         source.allowNextPoll.countDown();
         assertThat(acknowledged.await(2, TimeUnit.SECONDS)).isTrue();
+        assertThat(task.currentWatermark()).isEqualTo(950L);
 
         task.cancel();
         taskThread.join(2_000);
@@ -65,7 +67,26 @@ class SourceTaskCheckpointTest {
         assertThat(result.get().stateHandle()).isPresent();
         String snapshot = Files.readString(Path.of(result.get().stateHandle().orElseThrow().uri()));
         assertThat(snapshot).contains("watermark.max-event-time=1000");
+        assertThat(snapshot).contains("watermark.emitted=950");
         assertThat(snapshot).contains("source.handle.path=source-state.txt");
+
+        // The source remains blocked inside its first restored poll, so this proves published
+        // progress comes from the envelope rather than being inferred from a fresh watermark.
+        BlockingCheckpointableSource restoredSource = new BlockingCheckpointableSource();
+        SourceTask restored = new SourceTask("source#0", restoredSource,
+                new RuntimeSourceContext(0, 1, metrics), new RecordingOutput(),
+                Optional.of((TimestampAssigner<String>) value -> 1_000L), 50L, 0L, metrics);
+        restored.restore(result.get().stateHandle().orElseThrow());
+        Thread restoredThread = new Thread(restored, "restored-source-watermark");
+        restoredThread.start();
+        try {
+            assertThat(restoredSource.firstRecordEmitted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(restored.currentWatermark()).isEqualTo(950L);
+        } finally {
+            restored.cancel();
+            restoredThread.interrupt();
+            restoredThread.join(2_000);
+        }
     }
 
     @Test

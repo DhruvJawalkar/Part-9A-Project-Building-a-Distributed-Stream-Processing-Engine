@@ -61,6 +61,12 @@ dependencies {
     add("submitImplementation", project(":engine-master"))
     add("integrationTestImplementation", project(":engine-master"))
     add("integrationTestImplementation", project(":engine-worker"))
+    // Read real REST/MinIO Iceberg output after a worker process is force-killed.
+    add("integrationTestImplementation", libs.iceberg.core)
+    add("integrationTestImplementation", libs.iceberg.parquet)
+    add("integrationTestImplementation", libs.parquet.avro)
+    add("integrationTestImplementation", libs.minio)
+    add("integrationTestImplementation", libs.hadoop.mapreduce.client.core)
 }
 
 tasks.register<JavaExec>("submitToCluster") {

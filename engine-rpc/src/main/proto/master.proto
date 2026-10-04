@@ -78,7 +78,8 @@ message TaskStatus {
   TaskState state = 2;
   int64 records_in = 3;
   int64 records_out = 4;
-  int64 current_watermark = 5;
+  // Presence distinguishes an established watermark (including zero) from an uninitialized task.
+  optional int64 current_watermark = 5;
 
   // Phase 4 reports checkpoint cost here: duration, state size and alignment time. Declared
   // now because the heartbeat is the natural carrier and adding fields later would mean
@@ -88,7 +89,7 @@ message TaskStatus {
   int64 last_checkpoint_state_bytes = 8;
   int64 last_alignment_millis = 9;
 
-  // A task is backpressured only when its bounded input gate is full. Carrying the raw queue
+  // A task is backpressured when any bounded input channel is full. Carrying the raw queue
   // and capacity alongside the boolean makes the operational claim inspectable.
   bool backpressured = 10;
   int64 input_queued_elements = 11;

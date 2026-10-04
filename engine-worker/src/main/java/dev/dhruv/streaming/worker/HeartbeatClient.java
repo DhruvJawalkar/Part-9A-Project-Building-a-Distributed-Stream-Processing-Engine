@@ -141,6 +141,10 @@ final class HeartbeatClient implements AutoCloseable {
                         .setBackpressured(task.isBackpressured())
                         .setInputQueuedElements(task.inputQueuedElements())
                         .setInputCapacity(task.inputCapacity());
+                long watermark = task.currentWatermark();
+                if (watermark != Long.MIN_VALUE) {
+                    status.setCurrentWatermark(watermark);
+                }
                 task.sourceLag().ifPresent(lag -> {
                     status.setSourceLagAvailable(true);
                     lag.partitions().forEach(partition -> status.addSourceLag(SourcePartitionLag.newBuilder()

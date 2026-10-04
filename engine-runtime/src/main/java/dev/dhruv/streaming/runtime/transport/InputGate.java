@@ -251,6 +251,16 @@ public final class InputGate {
         return channelCount() * capacityPerChannel;
     }
 
+    /** One saturated channel blocks its own producer even if other queues are empty. */
+    public boolean hasFullChannel() {
+        lock.lock();
+        try {
+            return queues.stream().anyMatch(queue -> queue.size() >= capacityPerChannel);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /**
      * An element together with the channel it arrived on.
      *

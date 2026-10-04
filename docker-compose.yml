@@ -128,12 +128,10 @@ services:
         mc mb --ignore-existing local/warehouse
         echo "MinIO buckets ready: stream-checkpoints warehouse"
 
-  # Apache Iceberg's REST catalog stores table metadata in the MinIO warehouse. The engine
-  # workers run on the host in the demo, so they reach this service through localhost:8181;
-  # the catalog itself reaches MinIO through the Docker service name.
+  # Metadata JSON/Parquet lives in MinIO; the catalog's SQLite pointer database has its own
+  # volume so a normal Compose down/up does not lose tables while retaining their objects.
   iceberg-rest:
-    # 1.11.0 has no published versioned fixture image yet. 1.10.1 is the newest stable tag
-    # compatible with the engine's 1.11 REST client; pinning it keeps the demo reproducible.
+    # Pin the REST fixture tested with this repository's REST client.
     image: apache/iceberg-rest-fixture:1.10.1
     container_name: lms-iceberg-rest
     depends_on:
@@ -142,6 +140,7 @@ services:
     ports:
       - "8181:8181"
     environment:
+      CATALOG_URI: jdbc:sqlite:/tmp/iceberg_catalog.db
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
@@ -149,6 +148,8 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
+    volumes:
+      - iceberg-catalog-data:/tmp
 
   # Create the LMS namespace and tables before submitting the fixture job. These REST calls are
   # idempotent: 409 means the object already exists and is therefore success for this bootstrap.
@@ -313,10 +314,17 @@ services:
     command:
       - |
         set -e
-        /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
-          --topic lms.catalog.clicks < /fixtures/clicks.jsonl
-        /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
-          --topic lms.catalog.borrows < /fixtures/borrows.jsonl
+        # Every partition receives a progress record. Silence alone cannot advance event time
+        # and close the 15-minute sessions in this short replay. Round-robin is only fixture
+        # publication; the engine still uses the graph's keyed exchange for aggregation.
+        cat /fixtures/clicks.jsonl /fixtures/click-watermark-progress.jsonl | \
+          /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
+          --producer-property partitioner.class=org.apache.kafka.clients.producer.RoundRobinPartitioner \
+          --producer-property acks=all --topic lms.catalog.clicks
+        cat /fixtures/borrows.jsonl /fixtures/borrow-watermark-progress.jsonl | \
+          /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
+          --producer-property partitioner.class=org.apache.kafka.clients.producer.RoundRobinPartitioner \
+          --producer-property acks=all --topic lms.catalog.borrows
         echo "deterministic click and borrow fixtures published"
 
   prometheus:
@@ -362,3 +370,4 @@ volumes:
   minio-data:
   prometheus-data:
   grafana-data:
+  iceberg-catalog-data:
