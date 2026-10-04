@@ -66,6 +66,7 @@ public final class JobMaster implements AutoCloseable {
     private final Map<String, Instant> startedAt = new ConcurrentHashMap<>();
     private final Map<String, Set<String>> finishedTasks = new ConcurrentHashMap<>();
     private final Map<String, Map<String, TaskStatus>> taskStatuses = new ConcurrentHashMap<>();
+    private final Map<String, DeferredRecovery> deferredRecoveries = new LinkedHashMap<>();
     private final Set<String> quarantinedWorkers = ConcurrentHashMap.newKeySet();
 
     /**
@@ -113,9 +114,35 @@ public final class JobMaster implements AutoCloseable {
      * recovered tasks back to that stale registration. A process using the same stable id is
      * eligible again only after it performs a fresh control-plane registration.
      */
-    public void workerRegistered(String workerId) {
+    public synchronized void workerRegistered(String workerId) {
         quarantinedWorkers.remove(workerId);
         taskTracker.workerRegistered(workerId);
+        resumeDeferredRecoveries();
+    }
+
+    /**
+     * Retries startup recovery when durable worker leases change. The worker opens its heartbeat
+     * before advertising its lease, so the earlier registration RPC alone cannot see new capacity.
+     */
+    public synchronized void workerAvailabilityChanged() {
+        resumeDeferredRecoveries();
+    }
+
+    /** Caller holds this master's monitor, shared with recover() and control registration. */
+    private void resumeDeferredRecoveries() {
+        if (!deferredRecoveries.isEmpty()) {
+            List<RegisteredWorker> workers = schedulableWorkers();
+            for (Map.Entry<String, DeferredRecovery> entry : List.copyOf(deferredRecoveries.entrySet())) {
+                String jobId = entry.getKey();
+                JobState state = metadata.getJobState(jobId).orElse(JobState.FAILED);
+                if (state.isTerminal()) {
+                    deferredRecoveries.remove(jobId);
+                    continue;
+                }
+                DeferredRecovery recovery = entry.getValue();
+                restoreRecoveredPlan(jobId, recovery.graph(), recovery.assignments(), workers, state);
+            }
+        }
     }
 
     /**
@@ -227,6 +254,19 @@ public final class JobMaster implements AutoCloseable {
         if (current.isPresent() && !current.get().isTerminal()) {
             metadata.putJobState(jobId, JobState.FINISHED);
             checkpoints.stop(jobId);
+            ExecutionGraph plan = executionGraphs.get(jobId);
+            if (plan != null) {
+                try {
+                    // Finished threads still own input registrations and periodic flushers.
+                    // Release them before another submission reuses the same operator names.
+                    deployer.cancelAll(jobId, plan);
+                } catch (RuntimeException cleanupFailure) {
+                    // Completion is already durable: cleanup cannot turn processed input into
+                    // a replay or roll a successful job back to FAILED/RESTARTING.
+                    log.warn("job {} finished but worker resource cleanup failed", jobId,
+                            cleanupFailure);
+                }
+            }
             log.info("job {} finished", jobId);
         }
     }
@@ -455,13 +495,13 @@ public final class JobMaster implements AutoCloseable {
      * Recovers what this master was doing, after a restart.
      *
      * <p>Reads back every job it knew about, so that a restarted master can distinguish a job it
-     * should be watching from one that ended. Phase 4 extends this into genuine recovery: read
-     * the latest checkpoint pointer and redeploy from it. Here it is only the reading, which is
-     * what makes the acceptance criterion about a restarted master meaningful.
+     * should be watching from one that ended. Live graphs are reconciled from their latest
+     * durable checkpoint as a whole. If workers have not advertised enough capacity yet, retain
+     * the graph and assignments until registration or a durable lease change permits recovery.
      *
      * @return what was found, by job id
      */
-    public Map<String, RecoveredJob> recover() {
+    public synchronized Map<String, RecoveredJob> recover() {
         Map<String, RecoveredJob> recovered = new LinkedHashMap<>();
         List<RegisteredWorker> workers = metadata.listWorkers();
         deployer.observeWorkers(workers);
@@ -474,9 +514,6 @@ public final class JobMaster implements AutoCloseable {
             recovered.put(jobId, new RecoveredJob(jobId, state, assignments,
                     graph.map(bytes -> bytes.length).orElse(0), cause));
             graph.ifPresent(bytes -> restoreRecoveredPlan(jobId, bytes, assignments, workers, state));
-            if (state == JobState.FAILING || state == JobState.RESTARTING) {
-                resumeInterruptedRecovery(jobId, state);
-            }
             log.info("recovered job {} in state {} with {} assignments",
                     jobId, state, assignments.size());
         }
@@ -520,7 +557,26 @@ public final class JobMaster implements AutoCloseable {
         try {
             JobGraph graph = SerializationUtil.fromBytes(serializedGraph);
             jobGraphs.put(jobId, graph);
-            if (workers.isEmpty()) {
+            restoreRecoveredPlan(jobId, graph, assignments, workers, state);
+        } catch (RuntimeException failure) {
+            log.warn("could not reconstruct in-memory plan for recovered job {}: {}", jobId,
+                    failure.getMessage());
+        }
+    }
+
+    private void restoreRecoveredPlan(String jobId,
+                                      JobGraph graph,
+                                      Map<String, String> assignments,
+                                      List<RegisteredWorker> workers,
+                                      JobState state) {
+        try {
+            if (!state.isTerminal()) {
+                deferredRecoveries.put(jobId, new DeferredRecovery(graph, Map.copyOf(assignments)));
+            }
+            int availableSlots = workers.stream().mapToInt(RegisteredWorker::slots).sum();
+            if (workers.isEmpty() || availableSlots < assignments.size()) {
+                log.info("deferring recovery of job {}: waiting for {} task slots, currently {}",
+                        jobId, assignments.size(), availableSlots);
                 return;
             }
             ExecutionGraph freshlyCompiled = ExecutionGraphCompiler.compile(graph, workers);
@@ -543,6 +599,11 @@ public final class JobMaster implements AutoCloseable {
             ExecutionGraph restored = new ExecutionGraph(jobId, freshlyCompiled.vertices(),
                     freshlyCompiled.chainGroups(), restoredAssignments);
             executionGraphs.put(jobId, restored);
+            // Registration and recover() share this master's monitor. Remove the reservation
+            // before scheduling any restore so another registration cannot spend its budget
+            // or queue a second recovery of the same durable cut.
+            deferredRecoveries.remove(jobId);
+            deployer.observeWorkers(workers);
             if (state == JobState.RUNNING) {
                 // A surviving task may have an in-flight barrier whose id was never persisted.
                 // Starting a fresh coordinator against it could reuse that id and produce an
@@ -551,11 +612,16 @@ public final class JobMaster implements AutoCloseable {
                 // also replays the durable completion notification before barriers resume.
                 failJob(jobId, "master recovered a running job; reconciling every task from "
                         + "the latest completed checkpoint");
+            } else if (state == JobState.FAILING || state == JobState.RESTARTING) {
+                resumeInterruptedRecovery(jobId, state);
             }
         } catch (RuntimeException failure) {
             log.warn("could not reconstruct in-memory plan for recovered job {}: {}", jobId,
                     failure.getMessage());
         }
+    }
+
+    private record DeferredRecovery(JobGraph graph, Map<String, String> assignments) {
     }
 
     /**

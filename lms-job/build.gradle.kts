@@ -52,6 +52,12 @@ sourceSets {
 
 configurations["submitImplementation"].extendsFrom(configurations.implementation.get())
 configurations["submitRuntimeOnly"].extendsFrom(configurations.runtimeOnly.get())
+// Bootstrap policy tests exercise the submitter utilities without exposing their dependencies
+// to the main user-job compile surface.
+sourceSets.test {
+    compileClasspath += sourceSets["submit"].output + sourceSets["submit"].compileClasspath
+    runtimeClasspath += sourceSets["submit"].output + sourceSets["submit"].runtimeClasspath
+}
 configurations["integrationTestImplementation"]
     .extendsFrom(configurations.testImplementation.get())
 configurations["integrationTestRuntimeOnly"]
@@ -59,6 +65,8 @@ configurations["integrationTestRuntimeOnly"]
 
 dependencies {
     add("submitImplementation", project(":engine-master"))
+    add("submitImplementation", libs.kafka.clients)
+    add("submitImplementation", libs.jackson)
     add("integrationTestImplementation", project(":engine-master"))
     add("integrationTestImplementation", project(":engine-worker"))
     // Read real REST/MinIO Iceberg output after a worker process is force-killed.
@@ -76,6 +84,17 @@ tasks.register<JavaExec>("submitToCluster") {
     classpath = sourceSets["submit"].runtimeClasspath
 }
 
+tasks.register<JavaExec>("publishFixture") {
+    description = "Publishes the fixed LMS replay and explicit per-partition progress records."
+    group = "application"
+    mainClass.set("dev.dhruv.streaming.lms.PublishLmsFixture")
+    classpath = sourceSets["submit"].runtimeClasspath
+    args(rootProject.file("demos/fixtures").absolutePath)
+    if (providers.gradleProperty("fixtureProgressOnly").orNull == "true") {
+        args("--progress-only")
+    }
+}
+
 // Windows limits a process command line to roughly 32 KiB. This process-level test has a broad
 // runtime (master, workers, Iceberg, Testcontainers); expanding that graph once for Gradle's test
 // JVM and again in processTestClasspath crossed the limit when Phase 7 added metrics. A manifest
@@ -83,6 +102,10 @@ tasks.register<JavaExec>("submitToCluster") {
 val integrationTestPathingJar by tasks.registering(Jar::class) {
     archiveClassifier.set("integration-test-pathing")
     dependsOn(tasks.named("integrationTestClasses"))
+    // The manifest points at dependent project JARs. Build their producers as well as our
+    // classes, otherwise a focused test can silently launch an older master/worker binary.
+    dependsOn(sourceSets["integrationTest"].runtimeClasspath)
+    inputs.files(sourceSets["integrationTest"].runtimeClasspath)
     doFirst {
         manifest.attributes["Class-Path"] = sourceSets["integrationTest"].runtimeClasspath.files
             .joinToString(" ") { it.toURI().toASCIIString() }

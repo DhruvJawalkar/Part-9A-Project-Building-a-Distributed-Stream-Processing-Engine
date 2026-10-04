@@ -4,6 +4,7 @@ import dev.dhruv.streaming.api.Collector;
 import dev.dhruv.streaming.api.CheckpointBarrier;
 import dev.dhruv.streaming.api.CheckpointableSource;
 import dev.dhruv.streaming.api.Source;
+import dev.dhruv.streaming.api.SourceContext;
 import dev.dhruv.streaming.api.SourceLagReporter;
 import dev.dhruv.streaming.api.StreamRecord;
 import dev.dhruv.streaming.api.TimestampAssigner;

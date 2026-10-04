@@ -8,7 +8,8 @@ checkpoint-transactional Iceberg output.
 It accompanies **Part 9A: Stream Processing Fundamentals** of the *Developing Intuition on
 Building Blocks — Systems Design* series. The article explains how an engine like this works;
 this repository is a working one, built phase by phase so that each mechanism is demonstrable
-on its own before the next is added.
+on its own before the next is added. The supplied article is available as
+[Part 9A: Stream Processing Fundamentals (PDF)](docs/Part9A-article-StreamProcessingFundamentals.pdf).
 
 The design rationale, interfaces and algorithm sketches live in
 [`docs/Part9A_Project_Companion.pdf`](docs/Part9A_Project_Companion.pdf).
@@ -16,6 +17,8 @@ The design rationale, interfaces and algorithm sketches live in
 [`docs/DESIGN.md`](docs/DESIGN.md) is the living implementation design.
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) follows a record from the job DAG through
 scheduling, event time, checkpointing, state, transactional output, and recovery.
+[`docs/PHASE7-ACCEPTANCE.md`](docs/PHASE7-ACCEPTANCE.md) records final verification and the
+commands for the manual/demo confirmation pass.
 [`docs/BUG-LOG.md`](docs/BUG-LOG.md) records every bug found while building this, and why most of
 them produced no error at all.
 
@@ -40,7 +43,7 @@ implementation stops is part of understanding what production engines do for you
 | **4** | Checkpointing, barrier alignment, portable state, recovery | **Complete** |
 | **5** | Two-stream event-time interval join and conversion branch | **Complete** |
 | **6** | Transactional Iceberg sink, REST catalog and MinIO demo surface | **Complete** |
-| **7** | REST/Prometheus status, Grafana, Compose stack and four reproducible demos | **Complete** |
+| **7** | REST/Prometheus status, Grafana, Compose stack and four reproducible demos | **Complete — verified** |
 
 ---
 
@@ -55,6 +58,9 @@ docker compose up -d --build
 That command starts Kafka, etcd, MinIO, the Iceberg REST catalog, one master, three workers,
 Prometheus, and Grafana. One-shot bootstrap services create both Iceberg tables, submit the LMS
 job after all three workers register, and publish the deterministic click and borrow fixtures.
+With preserved volumes, bootstrap reuses a nonterminal LMS job and does not automatically replay
+fixtures into nonempty input topics. Use a fresh Compose project/volumes for a clean demonstration;
+`docker compose down` preserves data, while `down -v` is an explicit destructive reset.
 The status API is at <http://localhost:18080/jobs>, Prometheus at <http://localhost:9090>, and
 Grafana at <http://localhost:13000> (`admin` / `admin`). The deliberately offset host ports avoid
 collisions with common local web-development ports; `MASTER_STATUS_HOST_PORT`,
@@ -68,16 +74,20 @@ The host-launched workflow remains useful while changing Java code:
 ```bash
 docker compose up -d kafka etcd minio minio-init iceberg-rest
 ./demos/run-cluster.sh
+./gradlew :lms-job:submitToCluster
 ./demos/seed-clicks.sh
 ./demos/seed-borrows.sh
-./gradlew :lms-job:submitToCluster
+./demos/seed-watermark-progress.sh
 ```
 
 The job writes two unpartitioned Iceberg tables: `lms.analytics.browse_sessions` for closed
 `SessionRow` values and `lms.analytics.click_conversions` for a `RESULT_CLICK` followed by a
 matching borrow within 30 event-time minutes. Both input fixtures are deterministic, and
 click/borrow arrival order does not change the join result. `run-cluster.sh` initializes the
-schema as well, so the explicit init step can be omitted when using that launcher alone. Kafka
+schema as well, so the explicit init step can be omitted when using that launcher alone. The
+final progress seed advances every input partition beyond the short fixture's session gaps;
+wall-clock silence alone never closes an event-time window. Compose appends these clock records
+automatically. Kafka
 partition positions are owned by the engine: the next offset is captured in each source
 checkpoint, and recovery seeks to that offset without relying on broker-committed consumer-group
 positions. Run the full unit suite with `./gradlew test`. The focused Phase 3 proof is:
@@ -434,7 +444,13 @@ The shorter cadence makes rows visible sooner at the cost of more small files. T
 supports unpartitioned tables only; opening a partitioned destination fails explicitly rather than
 silently producing incorrect file metadata. The Compose REST-catalog/MinIO surface is executable
 demo infrastructure. The opt-in `IcebergRestMinioSmokeTest` verifies the real REST catalog,
-`S3FileIO`, MinIO write and checkpoint commit path; it is not claimed as a process-kill test.
+`S3FileIO`, MinIO write and checkpoint commit path. Phase 7 adds the real process-kill proof in
+`DistributedCheckpointRecoveryIT.killedSinkWorkerLeavesOrphanAndRecoversExactlyOnceIcebergRows`:
+a sink-owning worker is force-killed after closing durable, still-invisible Parquet files but
+before its checkpoint ACK. The restored pipeline commits exactly the clean table's two session
+rows once; the old files remain present and absent from reachable snapshots. This comparison uses
+a canonical `SessionRow` string column in two real REST/MinIO tables, not the production LMS
+table schema. The production schema is verified separately by connector tests and the full stack.
 
 ---
 
@@ -458,11 +474,14 @@ Each worker also serves `/metrics` on its metrics port. Task series retain `job`
 occupancy and `stream_engine_backpressured` reflect the real bounded `InputGate`; checkpoint
 duration, alignment, and state bytes come from the latest task acknowledgement. Kafka source lag
 is calculated from each source's owned partition positions and broker end offsets.
+Prometheus honors the engine's `job` UUID label. Grafana selects the worker series so a task
+does not appear twice through the worker scrape and the master's heartbeat projection.
 
-Three nullable/status-lifetime boundaries are intentional. `startedAt` is the current master's
+The nullable/status-lifetime boundaries are intentional. `startedAt` is the current master's
 admission timestamp and is `null` after master recovery because submission time is not persisted.
-Task `watermark` is currently `null` because heartbeats do not yet carry per-task event-time
-progress. Checkpoint counters/history are current-master operational history; etcd retains the
+Task `watermark` is `null` until the task has established event-time progress; heartbeats then
+carry its real, checkpoint-restored watermark (including a valid value of zero).
+Checkpoint counters/history are current-master operational history; etcd retains the
 latest completed recovery point, not an observability journal. `maxLagMillis` is `null` because
 Kafka offsets alone cannot reveal the timestamp of an unread record without fetching it.
 
@@ -475,17 +494,21 @@ one-shot services; Prometheus and Grafana are provisioned from files under `obse
 ### Four reproducible demonstrations
 
 Every script prints the signal to watch, the claim it proves, and the matching article section
-before it runs. The scripts use checked-in fixtures (or, for process recovery, a deterministic
-fixture embedded in the acceptance harness) and fail when the claimed outcome is absent.
+before it runs. The scripts use checked-in fixtures and run assertion-backed acceptance harnesses
+that fail when the claimed outcome is absent. Docker-backed demos launch their own isolated
+dependencies and master/worker JVMs; they do not kill your running Compose cluster.
 
 | Demo | Run | What to watch | What it proves |
 |---|---|---|---|
-| Worker dies mid-window | `./demos/demo-1-worker-loss.sh` | Session owner is force-killed; all tasks rewind; recovered bytes equal a clean run | A checkpoint is one distributed cut across offsets, state, timers, and output (§§10.1–10.3) |
-| Master dies | `./demos/demo-2-master-loss.sh` | A fresh master fences the old execution and restores every task from etcd/MinIO | Durable metadata, not master RAM, owns recovery (§§7, 10.3) |
+| Worker dies mid-window | `./demos/demo-1-worker-loss.sh` | Session-owner loss rewinds every task; sink-owner loss leaves an orphan; recovered bytes and Iceberg rows equal clean runs | A checkpoint is one distributed cut across offsets, state, timers, and output (§§10.1–10.3, 11) |
+| Master dies | `./demos/demo-2-master-loss.sh` | Workers progress while the master is force-killed; a fresh master restores every task from etcd/MinIO | Durable metadata, not master RAM, owns recovery (§§7, 10.3) |
 | Late event | `./demos/demo-3-late-event.sh` | Default policy drops/counts; configured lateness accepts and revises the open session | Watermarks turn completeness into an explicit policy (§§6.2–6.4) |
-| Hot key | `./demos/demo-4-hot-key.sh` | One unsalted owner exceeds capacity while siblings idle; salted local work is flat and output is unchanged | Per-subtask metrics reveal skew; two-stage aggregation fixes it (§§5.3, 9) |
+| Hot key | `./demos/demo-4-hot-key.sh` | One unsalted owner's real input queue saturates while siblings idle; salted local work is flat and output is unchanged | Per-subtask metrics reveal skew; two-stage aggregation fixes it (§§5.3, 9) |
 
-The salting flag is `-Dlms.sessions.salted=true`. It changes only the session branch:
+The salting flag is `-Dlms.sessions.salted=true` on a Java entry point, or
+`LMS_SESSIONS_SALTED=true` for Compose/Gradle submission (the JVM property takes precedence).
+Set it before submitting a fresh job; it does not mutate an already-running DAG.
+It changes only the session branch:
 
 ```text
 click -> deterministic salt -> HASH(member,salt) -> local session fragments
@@ -497,6 +520,14 @@ publishing, which gives every local salt time to close; the business `sessionEnd
 ordinary last-event-plus-gap value. Because `ClickEvent` has no immutable event id, byte-identical
 duplicate payloads deliberately choose the same salt. This preserves replay determinism while
 normal time-varying traffic is spread across the local stage.
+
+The stress fixture uses one hot **member**, the session branch's real key, rather than the
+article's catalog-item example. Demo 4 feeds the same fixed clicks through the production session
+topology in both modes and applies the same per-click work cost to both. It observes bounded-queue
+backpressure and per-subtask counts, not a capacity estimate masquerading as a runtime signal.
+Demo 3 exercises real source/task/watermark/state/timer loops locally. Its evidence is in
+`lms-job/build/demo-3/report.txt`; process-recovery evidence is under
+`lms-job/build/demo-evidence/`, and hot-key metrics, rows, and logs under `lms-job/build/demo-4/`.
 
 ### Late-data boundary
 
@@ -517,6 +548,7 @@ Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
 | Limitation | Why it is out of scope | The extension, if you want it |
 |---|---|---|
 | Master is a single point of failure | Leader election is Part 6 material; Flink has the same property without HA configured | etcd already holds the metadata — add a lease-based election and a standby master |
+| No partition-safe execution-epoch fencing | A failure detector cannot distinguish a dead worker from an unreachable live writer; cancellation is best effort across a network partition | Persist execution epochs and enforce sink-side fencing before claiming exactly-once under partitions |
 | No dynamic rescaling | Parallelism is fixed at submission. Key groups are implemented, so the hard part is done | Add a savepoint command, restore at a different parallelism, let `KeyGroupAssigner` redistribute |
 | No savepoints | Phase 4 checkpoints are recovery points managed by the running job, without user-triggered retention or restore selection | `POST /jobs/{id}/savepoint` and a `--fromSavepoint` flag |
 | No unaligned checkpoints | Phase 4 uses aligned barriers and buffers post-barrier records on blocked channels | Persist in-flight channel buffers for unaligned checkpoints |
@@ -524,10 +556,12 @@ Mirrors §15 of the companion PDF. These are scope decisions, not oversights.
 | No terminal checkpoint for bounded transactional jobs | Periodic checkpoints cover the Kafka-based LMS job, but a bounded source can end after its last barrier | Add an end-of-input protocol in which all sources request and wait for a coordinator-owned final checkpoint before emitting terminal watermarks |
 | No SQL or higher-level API | Framework DSLs are Parts 9B and 9C | A minimal SQL parser producing a `JobGraph` |
 | No security, multi-tenancy or resource isolation | Orthogonal to every mechanism being taught | — |
+| Task wire identities are operator/subtask scoped | Concurrent jobs that reuse operator ids are not isolated by the transport registry | Include job and execution identity in every channel and cancellation contract |
 
 Additionally, Phase 4 recovery remains at-least-once for non-transactional operators such as the
 console sink. Phase 6 provides exactly-once visible rows for completed checkpoint intervals in its
-unpartitioned Iceberg sink, while orphaned objects still require normal object-store maintenance.
+unpartitioned Iceberg sink for the tested process-crash/recovery paths, while orphaned objects still
+require normal object-store maintenance. This is not a network-partition exactly-once guarantee.
 The production LMS inputs are unbounded Kafka sources; bounded sources currently need an explicit
 checkpoint before exhaustion or their final post-checkpoint interval remains an orphan.
 `FileReplaySource` is bounded and deterministic. Job classes reach master and workers through a

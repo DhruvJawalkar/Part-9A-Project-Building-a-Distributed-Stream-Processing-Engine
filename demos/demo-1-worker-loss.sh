@@ -17,6 +17,9 @@ echo "Article: checkpointing and failure recovery (Part 9A, §§10.1–10.3)."
 echo
 
 cd "$ROOT"
-./gradlew :lms-job:integrationTest \
+./gradlew :lms-job:integrationTest --rerun \
   --tests 'dev.dhruv.streaming.lms.DistributedCheckpointRecoveryIT.killedSessionWorkerRestartsWholeJobFromPortableCheckpoint' \
   --tests 'dev.dhruv.streaming.lms.DistributedCheckpointRecoveryIT.killedSinkWorkerLeavesOrphanAndRecoversExactlyOnceIcebergRows'
+
+echo "Retained evidence: lms-job/build/demo-evidence/demo-1-session-worker-loss/"
+echo "Retained Iceberg evidence: lms-job/build/demo-evidence/demo-1-iceberg-worker-loss/"

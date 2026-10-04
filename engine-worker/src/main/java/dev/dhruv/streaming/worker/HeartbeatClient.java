@@ -15,7 +15,10 @@ import java.time.Duration;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 /**
  * Tells the master this worker is alive, once a second, and listens for what it says back.
@@ -46,19 +49,25 @@ final class HeartbeatClient implements AutoCloseable {
     static final Duration INTERVAL = Duration.ofSeconds(1);
 
     private final String workerId;
-    private final MasterServiceGrpc.MasterServiceStub master;
+    private final Function<StreamObserver<MasterCommand>, StreamObserver<WorkerBeat>> openHeartbeat;
     private final TaskManager taskManager;
     private final ScheduledExecutorService scheduler;
 
-    private volatile StreamObserver<WorkerBeat> beats;
+    private final AtomicReference<HeartbeatStream> currentStream = new AtomicReference<>();
     private final AtomicBoolean reconnectScheduled = new AtomicBoolean();
     private volatile boolean closed;
 
     HeartbeatClient(String workerId,
                     MasterServiceGrpc.MasterServiceStub master,
                     TaskManager taskManager) {
+        this(workerId, master::heartbeat, taskManager);
+    }
+
+    HeartbeatClient(String workerId,
+                    Function<StreamObserver<MasterCommand>, StreamObserver<WorkerBeat>> openHeartbeat,
+                    TaskManager taskManager) {
         this.workerId = workerId;
-        this.master = master;
+        this.openHeartbeat = openHeartbeat;
         this.taskManager = taskManager;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "heartbeat");
@@ -77,48 +86,88 @@ final class HeartbeatClient implements AutoCloseable {
     }
 
     private void openStream() {
+        // Consume the queued reconnect before opening: a synchronous failure may immediately
+        // schedule its successor, and resetting afterwards would erase that reservation.
+        reconnectScheduled.set(false);
         if (closed) {
             return;
         }
-        beats = master.heartbeat(new StreamObserver<>() {
-            @Override
-            public void onNext(MasterCommand command) {
-                handle(command);
-            }
+        HeartbeatStream candidate = new HeartbeatStream();
+        if (!currentStream.compareAndSet(null, candidate)) {
+            return;
+        }
+        try {
+            // Publish the generation before gRPC can invoke any callback. Installing the
+            // request observer afterwards must never revive a generation already retired.
+            candidate.requests = openHeartbeat.apply(new StreamObserver<>() {
+                @Override
+                public void onNext(MasterCommand command) {
+                    if (currentStream.get() == candidate && !closed) {
+                        handle(command);
+                    }
+                }
 
-            @Override
-            public void onError(Throwable error) {
-                // The master has gone. The worker deliberately keeps running: its tasks are
-                // processing records and stopping them would throw away work that a restarted
-                // master could still make use of. Losing coordination is not losing work --
-                // which is exactly what Demo 2 in Phase 7 sets out to show.
-                log.warn("lost the heartbeat stream to the master: {}", error.getMessage());
-                beats = null;
-                scheduleReconnect();
-            }
+                @Override
+                public void onError(Throwable error) {
+                    // The master has gone. The worker deliberately keeps running: its tasks are
+                    // processing records and stopping them would throw away work that a restarted
+                    // master could still make use of. Losing coordination is not losing work --
+                    // which is exactly what Demo 2 in Phase 7 sets out to show.
+                    if (retire(candidate)) {
+                        log.warn("lost the heartbeat stream to the master: {}", error.getMessage());
+                    }
+                }
 
-            @Override
-            public void onCompleted() {
-                log.info("the master closed the heartbeat stream; reconnecting");
-                beats = null;
-                scheduleReconnect();
+                @Override
+                public void onCompleted() {
+                    if (retire(candidate)) {
+                        log.info("the master closed the heartbeat stream; reconnecting");
+                    }
+                }
+            });
+            if (closed) {
+                currentStream.compareAndSet(candidate, null);
             }
-        });
-        reconnectScheduled.set(false);
+            if (closed || currentStream.get() != candidate) {
+                closeRequests(candidate);
+            }
+        } catch (RuntimeException failure) {
+            log.debug("could not open a heartbeat stream", failure);
+            retire(candidate);
+        }
+    }
+
+    private boolean retire(HeartbeatStream stream) {
+        if (stream != null && currentStream.compareAndSet(stream, null)) {
+            scheduleReconnect();
+            return true;
+        }
+        return false;
     }
 
     private void scheduleReconnect() {
         if (!closed && reconnectScheduled.compareAndSet(false, true)) {
-            scheduler.schedule(this::openStream, INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+            try {
+                scheduler.schedule(this::openStream, INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (RejectedExecutionException rejected) {
+                reconnectScheduled.set(false);
+                if (!closed) {
+                    throw rejected;
+                }
+            }
         }
     }
 
     private void beat() {
+        HeartbeatStream generation = currentStream.get();
         try {
-            StreamObserver<WorkerBeat> stream = beats;
-            if (stream == null) {
+            if (generation == null) {
                 scheduleReconnect();
                 return;
+            }
+            StreamObserver<WorkerBeat> stream = generation.requests;
+            if (stream == null) {
+                return; // This generation is still being opened.
             }
             WorkerBeat.Builder builder = WorkerBeat.newBuilder().setWorkerId(workerId);
 
@@ -160,8 +209,7 @@ final class HeartbeatClient implements AutoCloseable {
             // A failed beat is not worth failing the worker over. If the master really is gone,
             // it will stop hearing from this worker, which is the same signal either way.
             log.debug("a heartbeat could not be sent", e);
-            beats = null;
-            scheduleReconnect();
+            retire(generation);
         }
     }
 
@@ -189,12 +237,23 @@ final class HeartbeatClient implements AutoCloseable {
     public void close() {
         closed = true;
         scheduler.shutdownNow();
-        if (beats != null) {
+        HeartbeatStream stream = currentStream.getAndSet(null);
+        if (stream != null) {
+            closeRequests(stream);
+        }
+    }
+
+    private void closeRequests(HeartbeatStream stream) {
+        if (stream.requests != null) {
             try {
-                beats.onCompleted();
+                stream.requests.onCompleted();
             } catch (RuntimeException e) {
                 log.debug("closing the heartbeat stream failed", e);
             }
         }
+    }
+
+    private static final class HeartbeatStream {
+        private volatile StreamObserver<WorkerBeat> requests;
     }
 }

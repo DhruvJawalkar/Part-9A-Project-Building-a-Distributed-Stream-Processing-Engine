@@ -4,12 +4,15 @@ global:
 
 scrape_configs:
   - job_name: engine-master
+    # Engine task metrics use `job` for the submitted job UUID, not the scrape group.
+    honor_labels: true
     static_configs:
       - targets: ["master:8080"]
         labels:
           component: master
 
   - job_name: engine-workers
+    honor_labels: true
     static_configs:
       - targets: ["worker1:8081", "worker2:8081", "worker3:8081"]
         labels:

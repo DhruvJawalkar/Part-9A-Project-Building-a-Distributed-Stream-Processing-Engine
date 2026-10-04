@@ -1,7 +1,15 @@
-# Local pause checkpoint — 2026-10-04
+# Historical local pause checkpoint — 2026-10-04
+
+> Superseded by the user's resume request and completed Phase 7 verification. See
+> [PHASE7-ACCEPTANCE](PHASE7-ACCEPTANCE.md) for the final result. The original pause notes below
+> are retained as history, not current instructions.
 
 Development is **paused at the user's request** until they ask to resume. Do not
 automatically restart services or tests. Phase 7 is not yet accepted as complete.
+
+> Historical checkpoint: the user subsequently authorized resuming Phase 7, verifying it,
+> committing, and pushing the existing branch. The pause above no longer applies to that resumed
+> work. Final verification is recorded separately; the notes below preserve the original boundary.
 
 ## Saved state
 

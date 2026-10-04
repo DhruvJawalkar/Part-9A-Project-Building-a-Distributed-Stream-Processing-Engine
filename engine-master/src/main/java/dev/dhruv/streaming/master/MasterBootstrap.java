@@ -92,9 +92,11 @@ public final class MasterBootstrap implements AutoCloseable {
 
         // Watch rather than poll. A worker appearing should be schedulable at once, and a worker
         // vanishing should reach the master without waiting out a polling interval.
-        workerWatch = metadata.watchWorkers(workers ->
-                log.info("cluster now has {} worker(s): {}",
-                        workers.size(), workers.stream().map(RegisteredWorker::workerId).toList()));
+        workerWatch = metadata.watchWorkers(workers -> {
+            log.info("cluster now has {} worker(s): {}",
+                    workers.size(), workers.stream().map(RegisteredWorker::workerId).toList());
+            jobMaster.workerAvailabilityChanged();
+        });
 
         // Recover before accepting anything new, so that a restarted master knows what it was
         // already responsible for.

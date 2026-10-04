@@ -29,6 +29,15 @@ happened. Which bugs a design lets you make is worth knowing.
 | [11](#11-windows-line-endings-blocked-the-git-bash-cluster-script) | 4 | Windows line endings blocked the Git Bash cluster script | FIXED | No |
 | [12](#12-kafka-interrupt-during-worker-cancellation-looked-like-task-failure) | 4 | Kafka interrupt during worker cancellation looked like task failure | FIXED | No |
 | [13](#13-scheduled-flush-held-a-monitor-during-credit-wait) | 4 | Scheduled flush held a monitor during credit wait | FIXED | No |
+| [14](#14-user-code-had-two-class-identities-in-the-image) | 7 | User code had two class identities in the image | FIXED | No |
+| [15](#15-restoration-used-the-wrong-classloader) | 7 | Restoration used the wrong classloader | FIXED | No |
+| [16](#16-a-synchronous-checkpoint-ack-deadlocked-sink-completion) | 7 | A synchronous checkpoint ACK deadlocked sink completion | FIXED | Nearly |
+| [17](#17-concurrent-sink-commits-locked-the-demo-catalog) | 7 | Concurrent sink commits locked the demo catalog | FIXED | No |
+| [18](#18-registration-preceded-heartbeats-by-too-long) | 7 | Registration preceded heartbeats by too long | FIXED | Nearly |
+| [19](#19-the-catalog-lost-table-pointers-on-recreation) | 7 | The catalog lost table pointers on recreation | FIXED | Yes |
+| [20](#20-the-short-fixture-never-closed-its-sessions) | 7 | The short fixture never closed its sessions | FIXED | Yes |
+| [21](#21-a-retired-heartbeat-stream-overwrote-its-replacement) | 7 | A retired heartbeat stream overwrote its replacement | FIXED | Yes |
+| [22](#22-a-cold-master-never-scheduled-its-recovered-job) | 7 | A cold master never scheduled its recovered job | FIXED | Yes |
 
 ### The pattern worth noticing
 
@@ -341,6 +350,153 @@ flush must recheck the closed state after waking so it cannot publish a buffer a
 
 ---
 
+## 14. User code had two class identities in the image
+
+**Phase 7 · FIXED · visible**
+
+The first full Compose deployment packaged LMS classes into the engine application classpath as
+well as its user-code loader. Serialized job lambdas then resolved under a different loader from
+their declaring job types. Libraries using thread-context discovery also could not resolve the
+job's Iceberg/AWS implementation. Host tests had all dependencies on one classpath, hiding this.
+
+**The rule:** shared engine types have one parent identity; job-owned types and libraries use one
+explicit user-code classpath, including reflective discovery.
+
+- **Fix:** `Dockerfile` and `docker/engine-entrypoint.sh` package LMS separately;
+  `UserCodeClassLoader.configure` installs the same loader as the thread context loader.
+- **Coverage:** `UserCodeClassLoaderTest` and the freshly rebuilt full Compose LMS deployment.
+
+## 15. Restoration used the wrong classloader
+
+**Phase 7 · FIXED · visible**
+
+Deployment deserialization understood job classes, but checkpoint envelopes and transport values
+still used ordinary `ObjectInputStream`. A running job therefore worked until restore needed a
+job-owned state/timer-key type. This was hard to see because checkpoint creation succeeded.
+
+**The rule:** user types can occur at every serialization boundary, not only in the submitted DAG.
+
+- **Fix:** `UserCodeObjectInputStream.resolveClass` is shared by task copies, checkpoint readers,
+  keyed state restoration, and stream-element deserialization.
+- **Coverage:** distributed recovery harnesses and the containerized recovery/classpath checks.
+
+## 16. A synchronous checkpoint ACK deadlocked sink completion
+
+**Phase 7 · FIXED · nearly silent**
+
+The last sink task blocked waiting for its ACK RPC to return. Receiving that ACK caused the master
+to send completion back to the same sink and wait for its task-thread callback. The task could not
+run the callback until its original ACK returned. Every process was alive; the checkpoint stalled
+until deadlines exposed the cycle.
+
+**The rule:** an acknowledgement must not occupy the task thread needed by a response-triggered
+callback. Forward the barrier, submit the ACK asynchronously, and let the task drain callbacks.
+
+- **Fix:** `WorkerBootstrap.acknowledgeCheckpoint` uses the asynchronous master stub.
+- **Coverage:** full Compose checkpoint completion and transactional recovery acceptance.
+
+## 17. Concurrent sink commits locked the demo catalog
+
+**Phase 7 · FIXED · visible**
+
+Two sink callbacks on one worker committed different tables simultaneously through the fixture
+REST catalog's SQLite database. One failed with `SQLITE_BUSY`. Unit tests used an in-memory catalog
+and did not exercise that shared external writer bottleneck.
+
+**The rule:** keep the teaching catalog's transaction notifications explicit and sequential within
+a worker; do not report completion before its external commits finish.
+
+- **Fix:** `TaskManager.notifyCheckpointComplete` sorts participants and awaits each task-thread
+  future in order, with bounded sink-commit and master-RPC deadlines.
+- **Coverage:** the full two-table Compose fixture. This is not a general distributed SQLite
+  locking strategy; an external production catalog must supply its own concurrency guarantees.
+
+## 18. Registration preceded heartbeats by too long
+
+**Phase 7 · FIXED · nearly silent**
+
+A worker registered with the master, then waited for etcd lease setup before starting its
+heartbeat. During busy multi-container startup that consumed the three-second liveness grace
+period. A healthy newly registered worker was quarantined before it could report progress.
+
+**The rule:** the master's liveness obligation begins at registration, not when later bootstrap
+steps happen to finish.
+
+- **Fix:** `WorkerBootstrap.start` starts heartbeats immediately after master registration.
+- **Coverage:** three-worker Compose startup and process-recovery harness registration.
+
+## 19. The catalog lost table pointers on recreation
+
+**Phase 7 · FIXED · silent**
+
+MinIO retained table metadata and data objects, but the REST fixture stored its SQLite catalog
+pointer database in an ephemeral container `/tmp`. Compose down/up therefore retained objects
+while forgetting the tables referencing them. Persisting only the warehouse was insufficient.
+
+**The rule:** both object-store data and catalog pointers are durable state.
+
+- **Fix:** Compose mounts `iceberg-catalog-data` at `/tmp`, the image's writable database location.
+  A mount at `/catalog` was rejected by the image's non-root permissions during verification.
+- **Coverage:** catalog recreation with the same volume and unchanged table metadata pointers.
+
+## 20. The short fixture never closed its sessions
+
+**Phase 7 · FIXED · silent**
+
+The fixture covered about one minute, while session gaps were fifteen minutes. Kafka stayed open,
+so EOF did not advance its clock. Waiting longer in wall time never made these windows complete.
+All services and lag metrics looked healthy while no session rows became visible.
+
+**The rule:** reproducible streaming fixtures must advance every active input's event-time clock
+past the intended windows, rather than relying on silence as a completeness signal.
+
+- **Fix:** checked-in click/borrow progress fixtures use explicitly selected physical Kafka
+  partitions in Compose. `seed-watermark-progress.sh` does the same for the host launcher after
+  both business fixtures are published.
+- **Coverage:** full-stack fixture produces five session rows and three conversions.
+
+---
+
+## 21. A retired heartbeat stream overwrote its replacement
+
+- **What happened:** after force-killing and restarting the master, all task threads could finish
+  while the recovered job remained `RUNNING`: one worker never delivered its final heartbeat.
+- **Why it was hard to see:** restored output and newer checkpoints were correct. A gRPC failure
+  callback could run before `heartbeat(...)` returned, clear the stream, and then be overwritten
+  by the returning stale observer. Delayed callbacks from an older stream could also clear a
+  healthy replacement. Data-plane progress hid the control-plane failure.
+- **Rule:** publish a stream generation before opening it; only that generation may retire itself
+  using compare-and-set. Consume the reconnect reservation before opening, not afterwards.
+- **Fix:** `HeartbeatClient` tracks stream generations atomically and ignores obsolete callbacks.
+- **Coverage:** `HeartbeatClientTest` pins synchronous open failure, delayed old callbacks, and a
+  real gRPC outage/restart reporting tasks that finished during the outage.
+  `DistributedCheckpointRecoveryIT` also force-kills the real master process, observes workers
+  continuing, restores all tasks, completes a newer checkpoint, and reaches `FINISHED` with output
+  identical to the clean baseline.
+
+---
+
+## 22. A cold master never scheduled its recovered job
+
+- **What happened:** normal Compose down/up preserved the graph, checkpoint, offsets, and table
+  pointers, but the master started before worker leases existed. All 26 tasks stayed `UNKNOWN`.
+- **Why it was hard to see:** metadata still said `RUNNING`; the workers, metrics endpoints, and
+  catalog were healthy. `recover()` retained the graph but returned without a physical plan, and
+  later control registrations only reset the failure detector. Retrying only that RPC would still
+  miss the final capacity arrival: workers advertise their etcd lease after starting heartbeats.
+- **Rule:** deferred recovery must react to durable worker availability, not only startup's
+  snapshot or an earlier control registration. Waiting for capacity is not a failed restart.
+- **Fix:** `JobMaster` retains deferred graphs and assignment cardinality, waits for sufficient
+  slots, and retries on both registration and the `MasterBootstrap` worker watch. These paths
+  share its monitor with `recover()`. It removes the deferred reservation before scheduling one
+  whole-cut restore, including interrupted `FAILING`/`RESTARTING` states and replacement worker ids.
+- **Coverage:** `JobMasterTest` covers zero workers, gradual insufficient capacity without spending
+  restart attempts, all three durable states, exactly-once recovery scheduling, and control RPC
+  preceding lease publication. Full-stack preserved-volume verification is recorded in
+  [PHASE7-ACCEPTANCE](PHASE7-ACCEPTANCE.md).
+
+---
+
 ## Review notes
 
 Remaining review notes and resolved Phase 4 follow-ups.
@@ -360,10 +516,49 @@ splits the final `#` from `operatorId#subtaskIndex`, so a user-supplied operator
 contain `#`. The Phase 4 recovery harness exists, but it does not assert this unusual-id case;
 keep a focused worker failure-reporting test on the follow-up list.
 
-**R4 — `TaskTracker` cannot distinguish a dead worker from an unreachable one.** Not fixable —
-this is the failure detector problem — but the *consequence* changes by phase. In Phase 2 a
-partitioned worker can corrupt nothing, so assuming the worst is safe. From Phase 6 a partitioned
-worker could still be writing to Iceberg. Revisit then.
+**R4 — network-partition execution fencing. ACCEPTED teaching limitation.** `TaskTracker`
+cannot distinguish a dead worker from an unreachable live writer. Best-effort cancellation and
+checkpoint-id fencing do not enforce a sink-side execution epoch. Process-kill tests prove their
+own crash/recovery paths, not exactly-once under network partitions. A production extension must
+persist execution epochs and reject external commits from superseded workers. README and DESIGN
+name this boundary explicitly.
+
+**R5 — duplicate dashboard projections. RESOLVED in Phase 7 review.** Both master and workers
+publish task series. Unfiltered Grafana queries drew the same task twice, while Prometheus's
+default scrape `job` label obscured the engine's job UUID. Scrapes now honor engine labels and
+the four dashboard panels select worker-component series.
+
+**R6 — finished task registrations. RESOLVED in Phase 7 review.** Bounded jobs reached
+`FINISHED` but left their task map entries and flush timers registered on workers, preventing a
+subsequent submission from reusing the topology's ids. `JobMaster.finishJob` now persists terminal
+state, stops checkpoint coordination, and releases assignments through the existing cancellation
+path. `JobMasterTest` verifies ordering, duplicate terminal-heartbeat idempotence, and that a
+cleanup error does not turn a finished job into a replay.
+
+**R7 — status JSON escaping. RESOLVED in Phase 7 review.** Job names and failure causes may
+contain control characters. `StatusApi.quote` now escapes every JSON control code as well as
+quotes and backslashes; `StatusApiTest` verifies both job resources against this input.
+
+**R8 — small-fixture partition coverage. RESOLVED in Phase 7 verification.** The console
+producer's round-robin mode populated only two partitions per topic in the observed small replay.
+Idleness still let five sessions and three conversions complete, masking the missing coverage.
+`PublishLmsFixture` now uses explicit partition ids, publishes both business inputs before either
+clock fixture, and checks that progress-record count matches the partition count. Broker end
+offsets are checked during full-stack acceptance, not inferred from producer configuration.
+
+**R9 — salting on cluster submission. RESOLVED in Phase 7 review.** The local job entry point
+honored the salting flag but `SubmitLmsJob` called the intentionally unsalted default builder.
+Both executable entry points now select the configured mode; Compose exposes
+`LMS_SESSIONS_SALTED` and Java's `lms.sessions.salted` property takes precedence. The default graph
+builder remains configuration-independent. `LmsClickstreamJobTest` pins this distinction.
+
+**R10 — bootstrap after preserving volumes. RESOLVED in Phase 7 review.** Compose down/up
+recreates one-shot services while etcd, Kafka, and Iceberg retain their histories. Blindly
+submitting another same-id topology or reseeding business input would collide with restored tasks
+or append another replay. Compose now reuses one nonterminal LMS graph and skips fixture seeding
+only when every partition meets its complete fixture baseline; incomplete bootstrap fails closed
+with explicit recovery/reset guidance. `ComposeBootstrapTest` pins the policy. These checks are
+for the single local bootstrap, not a concurrent/distributed ingestion transaction protocol.
 
 ---
 

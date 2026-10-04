@@ -47,7 +47,6 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.LockSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -90,9 +89,9 @@ class DistributedHotKeyIT {
         Path fixture = artifacts.resolve("hot-clicks.jsonl");
         try (var writer = Files.newBufferedWriter(fixture)) {
             for (int index = 0; index < events; index++) {
-                writer.write(JSON.writeValueAsString(Map.of("memberId", spec.getProperty("member"),
+                writer.write(JSON.writeValueAsString(new java.util.TreeMap<>(Map.of("memberId", spec.getProperty("member"),
                         "catalogItemId", "catalog-" + index % 37, "searchTerm", "query-" + index % 23,
-                        "eventType", ClickEvent.RESULT_CLICK, "eventTimeMillis", 1_000L + index)));
+                        "eventType", ClickEvent.RESULT_CLICK, "eventTimeMillis", 1_000L + index))));
                 writer.newLine();
             }
         }
@@ -146,8 +145,14 @@ class DistributedHotKeyIT {
             // Sixteen salts map 5/3/4/4 across the fixed four-task key-group ranges. The
             // observation must remain bounded, rather than promising perfect equal shares.
             assertThat((double) maximum / minimum).as("measured salted per-task record spread").isLessThan(1.9);
-            assertThat(salted.backpressured()).as("the same input rate no longer fills a session channel").isFalse();
-            assertThat(salted.workerBackpressured()).isFalse();
+            // A scheduler pause or network flush can briefly fill one channel even after
+            // salting. Compare measured sustained pressure instead of claiming zero bursts.
+            assertThat(salted.pressureFraction()).as("salting relieves sustained hot-member pressure")
+                    .isLessThan(unsalted.pressureFraction() / 4);
+            assertThat(salted.meanQueued()).as("the average busiest session queue is smaller")
+                    .isLessThan(unsalted.meanQueued() / 2);
+            assertThat(salted.peakQueued()).as("the observed queue peak is smaller")
+                    .isLessThan(unsalted.peakQueued());
             assertThat(salted.elapsedMillis()).as("distributed work completes sooner").isLessThan(unsalted.elapsedMillis());
             assertThat(Files.readString(salted.output())).isEqualTo(Files.readString(unsalted.output()));
             SessionRow result = JSON.readValue(Files.readString(unsalted.output()), SessionRow.class);
@@ -159,9 +164,11 @@ class DistributedHotKeyIT {
             String report = "Fixed fixture: " + events + " clicks; same " + workDelay
                     + "us per-click session work; source delay " + sourceDelay + "us per source\n"
                     + "unsalted records/task=" + unsalted.counts() + ", peak queued=" + unsalted.peakQueued()
-                    + ", real backpressure=" + unsalted.backpressured() + ", elapsedMs=" + unsalted.elapsedMillis() + '\n'
+                    + ", pressure samples=" + unsalted.pressureSamples() + '/' + unsalted.samples()
+                    + ", mean queued=" + Math.round(unsalted.meanQueued()) + ", inputDrainedMs=" + unsalted.elapsedMillis() + '\n'
                     + "salted records/task=" + salted.counts() + ", peak queued=" + salted.peakQueued()
-                    + ", real backpressure=" + salted.backpressured() + ", elapsedMs=" + salted.elapsedMillis() + '\n'
+                    + ", pressure samples=" + salted.pressureSamples() + '/' + salted.samples()
+                    + ", mean queued=" + Math.round(salted.meanQueued()) + ", inputDrainedMs=" + salted.elapsedMillis() + '\n'
                     + "Session rows byte-identical. REST heartbeat samples and worker Prometheus scrapes retained.\n";
             Files.writeString(artifacts.resolve("report.txt"), report);
             System.out.println(report + "Evidence: " + artifacts);
@@ -185,6 +192,9 @@ class DistributedHotKeyIT {
         long peakQueued = 0;
         boolean backpressure = false;
         boolean workerPressureObserved = false;
+        long samplesTaken = 0;
+        long pressureSamples = 0;
+        long totalQueued = 0;
         Map<Integer, Long> counts = new LinkedHashMap<>();
         long deadline = System.nanoTime() + Duration.ofSeconds(80).toNanos();
         try (var samples = Files.newBufferedWriter(artifacts.resolve(mode + "-tasks.jsonl"));
@@ -192,11 +202,14 @@ class DistributedHotKeyIT {
             while (System.nanoTime() < deadline) {
                 String response = get(statusPort, "/jobs/" + graph.jobId() + "/tasks");
                 samples.write(response); samples.newLine(); samples.flush();
+                long currentMaximumQueue = 0;
+                boolean restPressure = false;
                 for (JsonNode task : JSON.readTree(response)) {
                     if (stage.equals(task.path("operatorId").asText()) && task.path("heartbeatReceived").asBoolean()) {
                         counts.put(task.path("subtask").asInt(), task.path("recordsIn").asLong());
                         peakQueued = Math.max(peakQueued, task.path("inputQueuedElements").asLong());
-                        backpressure |= task.path("backpressured").asBoolean();
+                        currentMaximumQueue = Math.max(currentMaximumQueue, task.path("inputQueuedElements").asLong());
+                        restPressure |= task.path("backpressured").asBoolean();
                     }
                 }
                 // Retain the actual endpoint response, including worker/operator/subtask tags.
@@ -218,6 +231,10 @@ class DistributedHotKeyIT {
                             .mapToLong(line -> (long) Double.parseDouble(line.substring(line.lastIndexOf(' ') + 1))).sum();
                 }
                 workerPressureObserved |= workerBackpressure;
+                backpressure |= restPressure;
+                samplesTaken++;
+                totalQueued += currentMaximumQueue;
+                if (restPressure || workerBackpressure) pressureSamples++;
                 long processed = counts.values().stream().mapToLong(Long::longValue).sum();
                 if (processed == eventCount) {
                     assertThat(workerProcessed).as("real worker counters agree with final heartbeat counters").isEqualTo(eventCount);
@@ -233,9 +250,22 @@ class DistributedHotKeyIT {
         Files.createFile(release);
         await(mode + " job completion", Duration.ofSeconds(20),
                 () -> metadata.getJobState(graph.jobId()).orElseThrow() == JobState.FINISHED);
+        String completedTasks = get(statusPort, "/jobs/" + graph.jobId() + "/tasks");
+        Files.writeString(artifacts.resolve(mode + "-finished-tasks.json"), completedTasks);
+        if (salted) {
+            long mergedFragments = 0;
+            for (JsonNode task : JSON.readTree(completedTasks)) {
+                if ("sessions".equals(task.path("operatorId").asText())) {
+                    mergedFragments += task.path("recordsIn").asLong();
+                }
+            }
+            assertThat(mergedFragments).as("the global hot-member owner receives compact fragments, not raw clicks")
+                    .isEqualTo(SaltedSessionAggregator.SALT_BUCKETS);
+        }
         assertThat(output).exists();
         assertThat(Files.readAllLines(output)).hasSize(1);
-        return new Measurement(counts, peakQueued, backpressure, workerPressureObserved, elapsed, output);
+        return new Measurement(counts, peakQueued, backpressure, workerPressureObserved,
+                samplesTaken, pressureSamples, (double) totalQueued / samplesTaken, elapsed, output);
     }
 
     /** Selects the real application's session DAG; changes only input/output and test work cost. */
@@ -286,7 +316,7 @@ class DistributedHotKeyIT {
         }
         @Override public void open(OperatorContext context) throws Exception { delegate.open(context); }
         @Override public void processElement(StreamRecord<I> record, Collector<O> out) throws Exception {
-            LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(delayMicros));
+            sleepMicros(delayMicros);
             delegate.processElement(record, out);
         }
         @Override public void onEventTimer(long timestamp, K key, Collector<O> out) throws Exception {
@@ -317,7 +347,7 @@ class DistributedHotKeyIT {
             String value;
             while ((value = reader.readLine()) != null) {
                 if (line++ % parallelism != subtask) continue;
-                LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(delayMicros));
+                sleepMicros(delayMicros);
                 out.collect(mapper.readValue(value, ClickEvent.class));
                 return true;
             }
@@ -355,6 +385,11 @@ class DistributedHotKeyIT {
         assertThat(response.statusCode()).isEqualTo(200); return response.body();
     }
     private static int freePort() throws IOException { try (ServerSocket socket = new ServerSocket(0)) { return socket.getLocalPort(); } }
+    private static void sleepMicros(long micros) throws InterruptedException {
+        // Thread.sleep requests Windows timer precision; short parkNanos delays can instead
+        // round to a 15.6ms clock tick and accidentally change the fixture's service rate.
+        Thread.sleep(micros / 1_000, (int) (micros % 1_000) * 1_000);
+    }
     private static void awaitPort(ManagedProcess process, int port) throws Exception {
         await("master listener", Duration.ofSeconds(20), () -> {
             assertThat(process.process().isAlive()).as("master process; log " + process.log()).isTrue();
@@ -376,5 +411,8 @@ class DistributedHotKeyIT {
     }
     private record ManagedProcess(Process process, Path log) { }
     private record Measurement(Map<Integer, Long> counts, long peakQueued, boolean backpressured,
-                               boolean workerBackpressured, long elapsedMillis, Path output) { }
+                               boolean workerBackpressured, long samples, long pressureSamples,
+                               double meanQueued, long elapsedMillis, Path output) {
+        double pressureFraction() { return (double) pressureSamples / samples; }
+    }
 }

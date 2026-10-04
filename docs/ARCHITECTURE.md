@@ -38,8 +38,9 @@ The target shape, from §4.1 of the companion PDF:
                                                        +----------------+
 ```
 
-**All seven phases are implemented.** A master process serves
-`MasterService` on :7000;
+**All seven phases are implemented and verified.** Final evidence is in
+[PHASE7-ACCEPTANCE](PHASE7-ACCEPTANCE.md). A master process serves
+`MasterService` on :7000 in the host launcher (:9090 inside Compose);
 three worker processes serve `WorkerService` and `DataTransportService` on separate ports and
 register in etcd under a TTL lease. Records cross process boundaries over gRPC with credit-based
 flow control. Source tasks now generate event-time watermarks and in-band idle/active status;
@@ -198,8 +199,17 @@ failed.
 
 Heartbeat clients reconnect after a master outage. A surviving worker's first beat seeds the
 replacement master's failure detector, and task-status samples repopulate its latest-status
-registry. A bounded job transitions to `FINISHED` only when every task in the recovered physical
+registry. Each stream has a generation installed before gRPC can invoke callbacks; an obsolete
+stream cannot clear a healthy replacement or revive itself after an immediate open failure.
+A bounded job transitions to `FINISHED` only when every task in the recovered physical
 plan reports completion.
+
+After a whole-cluster shutdown, the master may start before any worker lease is present. It keeps
+recovered graphs deferred until registered capacity can host the saved task count, without
+spending restart attempts merely waiting for startup. Both control registration and the etcd
+worker watch retry this readiness check: lease publication follows heartbeat startup, so the
+earlier registration RPC alone is insufficient. A shared monitor and a consumed reservation
+ensure only one whole-checkpoint restore is scheduled when capacity becomes available.
 
 ### Verified recovery run
 
@@ -281,6 +291,11 @@ The shorter cadence improves freshness but creates more small files. Partitioned
 not supported in Phase 6; the sink rejects them explicitly at open time. The REST/MinIO Compose
 surface is executable demo infrastructure. The opt-in `IcebergRestMinioSmokeTest` verifies its
 REST catalog, `S3FileIO`, MinIO write and completion path, but is not a process-kill test.
+`DistributedCheckpointRecoveryIT` supplies that separate process proof: it closes real Parquet
+files, blocks before the sink's checkpoint ACK, force-kills the sink worker, restores all tasks,
+and scans real REST/MinIO clean/recovered tables. Both contain the same two canonical session
+rows exactly once; the old closed objects remain unreachable orphans. The canonical-row comparison
+schema is deliberately smaller than the separately tested production LMS schema.
 The transaction guarantee covers completed checkpoint intervals. Bounded sources do not yet wait
 for a coordinator-owned terminal checkpoint, so their final post-barrier interval is a documented
 limitation; the LMS production sources are unbounded Kafka inputs.
@@ -364,8 +379,10 @@ sample. Unread-record age is not derivable without fetching those records, so `m
 explicitly `null` instead of a fabricated value.
 
 `startedAt` is the current master's admission time and becomes `null` after master recovery; the
-metadata schema does not persist a submission timestamp. Per-task `watermark` is also `null`
-because it has not yet been added to heartbeats. Checkpoint counts and history are operational
+metadata schema does not persist a submission timestamp. Per-task `watermark` is `null` until
+event-time progress is established; optional heartbeat presence distinguishes that absence from
+a valid zero timestamp. Source and operator watermarks survive checkpoint restore.
+Checkpoint counts and history are operational
 state for the current master, while etcd intentionally persists only the latest complete recovery
 point. These gaps are surfaced as null or reset values rather than inferred from unrelated clocks.
 

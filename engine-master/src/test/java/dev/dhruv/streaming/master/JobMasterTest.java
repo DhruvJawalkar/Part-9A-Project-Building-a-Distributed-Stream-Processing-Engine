@@ -115,6 +115,10 @@ class JobMasterTest {
     void boundedJobFinishesFromHeartbeatTaskStates() {
         JobGraph graph = lmsShapedJob();
         ExecutionGraph plan = master.submit(graph, SerializationUtil.toBytes(graph));
+        deployer.onCancellation = () -> {
+            assertThat(master.stateOf(graph.jobId())).contains(JobState.FINISHED);
+            assertThat(master.triggerCheckpoint(graph.jobId())).isEmpty();
+        };
 
         plan.assignments().keySet().forEach(key -> {
             int separator = key.lastIndexOf(':');
@@ -133,6 +137,27 @@ class JobMasterTest {
         assertThat(master.taskStatuses(graph.jobId())).hasSize(plan.taskCount());
         assertThat(master.taskStatuses(graph.jobId()).values())
                 .allMatch(status -> status.getRecordsIn() == 7);
+        assertThat(deployer.cancelledJobs).containsExactly(graph.jobId());
+        master.taskStatuses(graph.jobId()).values().forEach(master::onTaskStatus);
+        master.finishJob(graph.jobId());
+        assertThat(deployer.cancelledJobs).containsExactly(graph.jobId());
+    }
+
+    @Test
+    void cleanupFailureDoesNotChangeDurableFinishedStateOrReplayTheJob() {
+        JobGraph graph = lmsShapedJob();
+        master.submit(graph, SerializationUtil.toBytes(graph));
+        deployer.failCancellation = true;
+
+        master.finishJob(graph.jobId());
+        master.finishJob(graph.jobId());
+        master.onTaskFailure(graph.jobId(), "clicks:0", "late task report after completion");
+
+        assertThat(master.stateOf(graph.jobId())).contains(JobState.FINISHED);
+        assertThat(master.triggerCheckpoint(graph.jobId())).isEmpty();
+        assertThat(deployer.cancelledJobs).containsExactly(graph.jobId());
+        assertThat(deployer.recoveredDeployments).isEmpty();
+        assertThat(master.restartCount(graph.jobId())).isZero();
     }
 
     @Test
@@ -290,6 +315,108 @@ class JobMasterTest {
 
             assertThat(recoveredDeployer.restarted.await(1, TimeUnit.SECONDS)).isTrue();
             assertThat(awaitState(restarted, graph.jobId(), JobState.RUNNING)).isTrue();
+        } finally {
+            restarted.close();
+        }
+    }
+
+    @Test
+    void coldMasterWaitsForWorkersBeforeReconcilingRecoveredRunningGraph() throws Exception {
+        assertColdRecoveryWaitsForCapacity(JobState.RUNNING);
+    }
+
+    @Test
+    void coldMasterWaitsForWorkersBeforeResumingDurableFailingGraph() throws Exception {
+        assertColdRecoveryWaitsForCapacity(JobState.FAILING);
+    }
+
+    @Test
+    void coldMasterWaitsForWorkersBeforeResumingDurableRestartingGraph() throws Exception {
+        assertColdRecoveryWaitsForCapacity(JobState.RESTARTING);
+    }
+
+    @Test
+    void workerLeasePublishedAfterControlRegistrationUnblocksDeferredRecovery() throws Exception {
+        assertColdRecoveryWaitsForCapacity(JobState.RUNNING, true);
+    }
+
+    private void assertColdRecoveryWaitsForCapacity(JobState durableState) throws Exception {
+        assertColdRecoveryWaitsForCapacity(durableState, false);
+    }
+
+    private void assertColdRecoveryWaitsForCapacity(JobState durableState, boolean leaseAfterRpc) throws Exception {
+        JobGraph graph = lmsShapedJob();
+        ExecutionGraph original = master.submit(graph, SerializationUtil.toBytes(graph));
+        CompletedCheckpoint checkpoint = checkpointFor(original);
+        metadata.putLatestCompletedCheckpoint(graph.jobId(), checkpoint);
+        metadata.putJobState(graph.jobId(), durableState);
+        master.close();
+        registrations.forEach(MetadataStore.WorkerRegistration::close);
+        registrations.clear();
+        assertThat(metadata.listWorkers()).isEmpty();
+
+        RecordingDeployer recoveredDeployer = new RecordingDeployer();
+        JobMaster restarted = new JobMaster(metadata, recoveredDeployer,
+                new CheckpointCoordinator.Config(Duration.ofDays(1), Duration.ofSeconds(1)),
+                new RestartStrategy(1, Duration.ZERO));
+        try {
+            restarted.recover();
+            assertThat(restarted.stateOf(graph.jobId())).contains(durableState);
+            assertThat(restarted.planOf(graph.jobId())).isEmpty();
+            assertThat(restarted.restartCount(graph.jobId())).isZero();
+            assertThat(restarted.triggerCheckpoint(graph.jobId())).isEmpty();
+
+            for (int worker = 1; worker <= 2; worker++) {
+                String workerId = "replacement-" + worker;
+                if (leaseAfterRpc) {
+                    restarted.workerRegistered(workerId);
+                }
+                registrations.add(metadata.registerWorker(new RegisteredWorker(workerId,
+                        "localhost", 9000 + worker, 9100 + worker, 2), 60));
+                if (leaseAfterRpc) {
+                    restarted.workerAvailabilityChanged();
+                } else {
+                    restarted.workerRegistered(workerId);
+                }
+                assertThat(restarted.stateOf(graph.jobId())).contains(durableState);
+                assertThat(restarted.planOf(graph.jobId())).isEmpty();
+                assertThat(restarted.restartCount(graph.jobId())).isZero();
+                assertThat(recoveredDeployer.cancelledJobs).isEmpty();
+                assertThat(recoveredDeployer.recoveredDeployments).isEmpty();
+            }
+
+            if (leaseAfterRpc) {
+                restarted.workerRegistered("replacement-3");
+                assertThat(restarted.restartCount(graph.jobId())).isZero();
+                assertThat(recoveredDeployer.recoveredDeployments).isEmpty();
+            }
+            registrations.add(metadata.registerWorker(new RegisteredWorker("replacement-3",
+                    "localhost", 9003, 9103, 2), 60));
+            if (leaseAfterRpc) {
+                restarted.workerAvailabilityChanged();
+            } else {
+                restarted.workerRegistered("replacement-3");
+            }
+            assertThat(recoveredDeployer.restarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(awaitState(restarted, graph.jobId(), JobState.RUNNING)).isTrue();
+            assertThat(recoveredDeployer.lastRecoveryHandles).hasSize(original.taskCount());
+            assertThat(recoveredDeployer.lastRecoveryWorkers)
+                    .containsExactly("replacement-1", "replacement-2", "replacement-3");
+            assertThat(recoveredDeployer.notifiedCheckpoints)
+                    .containsExactly(graph.jobId() + ":" + checkpoint.checkpointId());
+            assertThat(restarted.restartCount(graph.jobId())).isEqualTo(1);
+
+            restarted.workerRegistered("replacement-1");
+            restarted.workerRegistered("replacement-2");
+            restarted.workerRegistered("replacement-3");
+            restarted.workerAvailabilityChanged();
+            assertThat(recoveredDeployer.recoveredDeployments).containsExactly(graph.jobId());
+            assertThat(restarted.restartCount(graph.jobId())).isEqualTo(1);
+            if (durableState == JobState.RESTARTING) {
+                assertThat(recoveredDeployer.cancelledJobs).isEmpty();
+            } else {
+                assertThat(recoveredDeployer.cancelledJobs).containsExactly(graph.jobId());
+            }
         } finally {
             restarted.close();
         }
@@ -528,6 +655,8 @@ class JobMasterTest {
         private boolean failRecoveredDeployment;
         private boolean failInitialDeployment;
         private boolean failNextNotification;
+        private boolean failCancellation;
+        private Runnable onCancellation = () -> { };
 
         @Override
         public void deploy(JobGraph graph, ExecutionGraph plan, List<RegisteredWorker> workers) {
@@ -546,6 +675,10 @@ class JobMasterTest {
         @Override
         public void cancelAll(String jobId, ExecutionGraph plan) {
             cancelledJobs.add(jobId);
+            onCancellation.run();
+            if (failCancellation) {
+                throw new IllegalStateException("simulated worker cleanup failure");
+            }
         }
 
         @Override

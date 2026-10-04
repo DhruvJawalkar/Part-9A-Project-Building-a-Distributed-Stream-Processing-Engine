@@ -75,7 +75,9 @@ class LateEventPipelineAcceptanceTest {
         try (LocalJobExecutor executor = new LocalJobExecutor(job.build())) {
             executor.start();
             executor.awaitTermination();
-            return new Result(List.copyOf(ROWS), executor.metrics().get("sessions#0"));
+            Map<String, Long> metrics = executor.metrics().get("sessions(1/1)");
+            assertThat(metrics).as("the local executor's session task metrics").isNotNull();
+            return new Result(List.copyOf(ROWS), metrics);
         }
     }
 

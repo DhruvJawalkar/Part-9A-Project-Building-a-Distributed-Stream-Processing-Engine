@@ -164,7 +164,9 @@ public final class LmsClickstreamJob {
         SALTED;
 
         static SessionAggregationMode fromSystemProperty() {
-            return Boolean.parseBoolean(System.getProperty("lms.sessions.salted", "false"))
+            String configured = System.getProperty("lms.sessions.salted",
+                    System.getenv().getOrDefault("LMS_SESSIONS_SALTED", "false"));
+            return Boolean.parseBoolean(configured)
                     ? SALTED : UNSALTED;
         }
     }

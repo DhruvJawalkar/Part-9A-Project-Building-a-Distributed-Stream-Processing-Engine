@@ -1,7 +1,7 @@
 # Engine design
 
-This living design document records what is implemented through **Phase 6** and labels only the
-remaining **Phase 7** work as planned. This is a teaching engine: its source shows the mechanism
+This living design document records the verified implementation through **Phase 7**.
+Final evidence is in [PHASE7-ACCEPTANCE](PHASE7-ACCEPTANCE.md). This is a teaching engine: its source shows the mechanism
 directly instead of hiding it behind a production framework.
 
 The companion rationale is in [Part9A_Project_Companion.pdf](Part9A_Project_Companion.pdf); the
@@ -17,7 +17,7 @@ authoritative build sequence is in [CLAUDE.md](../CLAUDE.md).
 | 4 | Complete | Aligned checkpoints, RocksDB state, MinIO archives and whole-job recovery |
 | 5 | Complete | Tagged two-stream interval join and LMS conversion branch |
 | 6 | Complete | Checkpoint-transactional Iceberg output, REST catalog and MinIO demo setup |
-| 7 | **Planned** | Status API, dashboard and reproducible demos |
+| 7 | Complete — verified | Status API, dashboard and reproducible demos |
 
 ## Core rules
 
@@ -342,10 +342,17 @@ appears once. The deterministic six-event cadence figures are:
 
 The trade-off is earlier visibility versus more small files. Partitioned Iceberg tables are a
 deliberate Phase 6 limitation; the sink fails explicitly instead of constructing incorrect
-partition metadata. Compose supplies an executable REST/MinIO demo surface, but the automated
-acceptance test does not claim process-level REST/S3 or worker-kill coverage. The opt-in
+partition metadata. Compose supplies an executable REST/MinIO demo surface. The opt-in
 `IcebergRestMinioSmokeTest` separately verifies the real REST catalog, `S3FileIO`, MinIO write and
 checkpoint-completion path.
+
+Phase 7's `DistributedCheckpointRecoveryIT` adds a real sink-worker force-kill. Its sink wrapper
+waits after the actual `IcebergSink.preCommit` closes Parquet but before acknowledging that
+checkpoint; the test kills the owner and restores the whole DAG from the earlier checkpoint.
+Two real REST/MinIO tables are scanned and compared as canonical `SessionRow` strings. Recovered
+output contains each of the clean table's two rows exactly once, and closed old Parquet files
+still exist without appearing in reachable snapshots. The comparison's one-column canonical
+schema isolates transaction/recovery semantics; production LMS schemas have separate coverage.
 
 ## Connectors
 
@@ -374,12 +381,15 @@ second thread. Lag time remains `null`: the age of unread records cannot be deri
 offsets alone.
 
 The status contract exposes its persistence boundary. Admission `startedAt` is held by the current
-master and is null after recovery; per-task watermark is null until heartbeats carry that value;
+master and is null after recovery; per-task watermark is null until event-time progress is
+established, after which heartbeats carry the actual checkpoint-restored value;
 checkpoint history is current-master operational memory while etcd stores only the latest durable
 recovery point. These values are never reconstructed from wall-clock guesses.
 
 Prometheus series keep job/operator/subtask/worker labels. Grafana provisions four panels only:
 source lag; checkpoint duration and alignment; records-in per subtask; and state size per subtask.
+Scrapes honor the engine's `job` UUID label; dashboard queries select `component="worker"` to
+avoid displaying the same task twice through both its worker and the master's heartbeat view.
 The four scripts under `demos/` bind each panel or state transition to a fixed proof: worker loss,
 master loss, late data, and a hot key.
 
@@ -400,6 +410,12 @@ upsert/equality-delete contract.
 There is one master, fixed parallelism, no savepoints, no dynamic rescaling, no SQL layer, and no
 security/multi-tenancy/resource isolation. Checkpoint recovery, interval joining and transactional
 output for completed checkpoint intervals in unpartitioned Iceberg tables are implemented.
+Task transport and cancellation identities are operator/subtask scoped; this launcher is for one
+active topology, not concurrent jobs reusing the same operator ids. Finished jobs release their
+worker registrations before a sequential run reuses those ids.
+There is no sink-enforced execution-epoch fencing: an unreachable live worker may outlast
+best-effort cancellation, so process-kill recovery proofs do not establish exactly-once under a
+network partition. A production design must reject commits from superseded executions.
 Non-transactional console sinks remain at-least-once. Bounded sources do not yet coordinate a
 terminal checkpoint, so their post-last-barrier transactional output is deliberately not claimed;
 the LMS production topology uses unbounded Kafka sources. These omissions are visible so the code shows

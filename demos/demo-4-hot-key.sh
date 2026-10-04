@@ -19,6 +19,6 @@ echo
 
 cd "$ROOT"
 ./gradlew :lms-job:integrationTest \
-  --tests 'dev.dhruv.streaming.lms.DistributedHotKeyIT' --rerun-tasks
+  --tests 'dev.dhruv.streaming.lms.DistributedHotKeyIT' --rerun
 echo "Measured proof and raw task/Prometheus samples: lms-job/build/demo-4/"
 cat "$ROOT/lms-job/build/demo-4/report.txt"

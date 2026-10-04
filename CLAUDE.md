@@ -284,10 +284,14 @@ The four demos (PDF §13.2): worker dies mid-window; master dies; late event; ho
 5. `SaltedSessionAggregator` — the two-phase local-then-global fix for Demo 4, enabled by a config flag so the demo can run both ways.
 
 **Acceptance:**
-- [ ] `docker compose up` brings up the full stack and the seed job publishes the fixture.
-- [ ] All four demo scripts run end to end and produce the expected observable outcome.
-- [ ] Demo 4 shows one subtask backpressured with siblings idle, then flat distribution after enabling salting.
-- [ ] README documents each demo: what to run, what to watch, what it proves, and which article section it corresponds to.
+- [x] `docker compose up` brings up the full stack and the seed job publishes the fixture.
+- [x] All four demo scripts run end to end and produce the expected observable outcome.
+- [x] Demo 4 shows one subtask backpressured with siblings idle, then flat distribution after enabling salting.
+- [x] README documents each demo: what to run, what to watch, what it proves, and which article section it corresponds to.
+
+Verified 2026-10-04; final results and scoped limitations are in
+[`docs/PHASE7-ACCEPTANCE.md`](docs/PHASE7-ACCEPTANCE.md). Earlier phase checkboxes preserve
+the original build targets; current implementation status is tracked in README and DESIGN.
 
 ---
 

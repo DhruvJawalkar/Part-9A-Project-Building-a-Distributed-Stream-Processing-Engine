@@ -120,6 +120,26 @@ class LmsClickstreamJobTest {
     }
 
     @Test
+    void executableConfigurationSelectsSaltingWithoutChangingTheDefaultBuilder() {
+        String previous = System.getProperty("lms.sessions.salted");
+        try {
+            System.setProperty("lms.sessions.salted", "true");
+            assertThat(LmsClickstreamJob.SessionAggregationMode.fromSystemProperty())
+                    .isEqualTo(LmsClickstreamJob.SessionAggregationMode.SALTED);
+            assertThat(LmsClickstreamJob.buildGraph(
+                    LmsClickstreamJob.SessionAggregationMode.fromSystemProperty())
+                    .operator("local-sessions")).isPresent();
+            assertThat(LmsClickstreamJob.buildGraph().operator("local-sessions")).isEmpty();
+            System.setProperty("lms.sessions.salted", "false");
+            assertThat(LmsClickstreamJob.SessionAggregationMode.fromSystemProperty())
+                    .isEqualTo(LmsClickstreamJob.SessionAggregationMode.UNSALTED);
+        } finally {
+            if (previous == null) System.clearProperty("lms.sessions.salted");
+            else System.setProperty("lms.sessions.salted", previous);
+        }
+    }
+
+    @Test
     @DisplayName("unions tagged inputs before hashing conversions by member and item")
     void conversionsAreAKeyedTwoSidedIntervalJoin() {
         JobGraph graph = LmsClickstreamJob.buildGraph();

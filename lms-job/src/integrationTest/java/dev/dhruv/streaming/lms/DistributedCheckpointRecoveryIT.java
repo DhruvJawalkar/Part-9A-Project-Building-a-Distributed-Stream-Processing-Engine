@@ -82,7 +82,9 @@ class DistributedCheckpointRecoveryIT {
     private static final Network NETWORK = Network.newNetwork();
 
     @Container
-    private static final GenericContainer<?> ETCD = new GenericContainer<>(
+    // Each demonstrated cluster owns its control-plane history. Reusing a stopped cluster's
+    // jobs and still-expiring worker leases would make the next master recover another test.
+    private final GenericContainer<?> etcd = new GenericContainer<>(
             DockerImageName.parse("quay.io/coreos/etcd:v3.5.17"))
             .withExposedPorts(2379)
             .withCommand("etcd", "--listen-client-urls=http://0.0.0.0:2379",
@@ -111,7 +113,7 @@ class DistributedCheckpointRecoveryIT {
         Path release = temporaryDirectory.resolve("cluster.release");
         JobGraph graph = graph("phase-four-process-recovery", fixture, release, recoveredOutput);
 
-        String etcdEndpoint = "http://" + ETCD.getHost() + ':' + ETCD.getMappedPort(2379);
+        String etcdEndpoint = "http://" + etcd.getHost() + ':' + etcd.getMappedPort(2379);
         String minioEndpoint = "http://" + MINIO.getHost() + ':' + MINIO.getMappedPort(9000);
         String bucket = "phase4-recovery-" + UUID.randomUUID().toString().replace("-", "");
         String classpath = requiredProperty("processTestClasspath");
@@ -194,7 +196,7 @@ class DistributedCheckpointRecoveryIT {
             ManagedProcess killed = Objects.requireNonNull(workers.get(killedWorkerId));
             killed.process().destroyForcibly();
             assertThat(killed.process().waitFor(10, TimeUnit.SECONDS))
-                    .as("the selected alpha-session worker must be force-killed")
+                    .as("the selected beta-session worker must be force-killed")
                     .isTrue();
 
             try {
@@ -238,7 +240,7 @@ class DistributedCheckpointRecoveryIT {
         JobGraph graph = graph("phase-seven-master-recovery",
                 new GatedReplaySource(fixture, release, 3, outageRelease, outageProgress), output);
 
-        String etcdEndpoint = "http://" + ETCD.getHost() + ':' + ETCD.getMappedPort(2379);
+        String etcdEndpoint = "http://" + etcd.getHost() + ':' + etcd.getMappedPort(2379);
         String minioEndpoint = "http://" + MINIO.getHost() + ':' + MINIO.getMappedPort(9000);
         String bucket = "master-recovery-" + UUID.randomUUID().toString().replace("-", "");
         String classpath = requiredProperty("processTestClasspath");
@@ -331,9 +333,18 @@ class DistributedCheckpointRecoveryIT {
                             .filter(next -> next.checkpointId() > checkpoint.checkpointId()
                                     && next.taskStates().size() == 5).isPresent());
             Files.createFile(release);
-            awaitCondition("master-recovered job to finish", Duration.ofSeconds(20),
-                    () -> metadata.getJobState(graph.jobId()).orElse(JobState.FAILED)
-                            == JobState.FINISHED);
+            try {
+                awaitCondition("master-recovered job to finish", Duration.ofSeconds(20),
+                        () -> metadata.getJobState(graph.jobId()).orElse(JobState.FAILED)
+                                == JobState.FINISHED);
+            } catch (AssertionError failure) {
+                String statuses = taskStatuses(statusPort, graph.jobId());
+                Files.writeString(temporaryDirectory.resolve("recovered-task-statuses.json"), statuses);
+                throw new AssertionError("recovered task status: " + statuses,
+                        recoveryFailure(metadata, graph.jobId(), processes, failure));
+            }
+            Files.writeString(temporaryDirectory.resolve("recovered-task-statuses.json"),
+                    taskStatuses(statusPort, graph.jobId()));
             assertThat(Files.readAllBytes(output)).containsExactly(baseline);
             System.out.println("MASTER RECOVERED: all tasks restored; rows equal the clean replay");
             passed = true;
@@ -342,6 +353,11 @@ class DistributedCheckpointRecoveryIT {
             Path evidence = exportEvidence("demo-2-master-loss", fixture, processes, passed);
             if (Files.exists(output)) {
                 Files.copy(output, evidence.resolve("session-rows.txt"), StandardCopyOption.REPLACE_EXISTING);
+            }
+            Path statuses = temporaryDirectory.resolve("recovered-task-statuses.json");
+            if (Files.exists(statuses)) {
+                Files.copy(statuses, evidence.resolve("recovered-task-statuses.json"),
+                        StandardCopyOption.REPLACE_EXISTING);
             }
         }
     }
@@ -403,7 +419,7 @@ class DistributedCheckpointRecoveryIT {
                                     TableIdentifier cleanId, Table cleanTable,
                                     TableIdentifier recoveredId, Table recoveredTable,
                                     List<String> expected) throws Exception {
-        String etcdEndpoint = "http://" + ETCD.getHost() + ':' + ETCD.getMappedPort(2379);
+        String etcdEndpoint = "http://" + etcd.getHost() + ':' + etcd.getMappedPort(2379);
         String minioEndpoint = "http://" + MINIO.getHost() + ':' + MINIO.getMappedPort(9000);
         String bucket = "iceberg-recovery-" + UUID.randomUUID().toString().replace("-", "");
         String classpath = requiredProperty("processTestClasspath");
@@ -539,6 +555,13 @@ class DistributedCheckpointRecoveryIT {
         try (JobClient client = new JobClient("127.0.0.1", port)) {
             assertThat(client.submit(graph, 3, 15).getAccepted()).isTrue();
         }
+    }
+
+    private static String taskStatuses(int port, String jobId) throws Exception {
+        return java.net.http.HttpClient.newHttpClient().send(
+                java.net.http.HttpRequest.newBuilder(URI.create("http://127.0.0.1:"
+                        + port + "/jobs/" + jobId + "/tasks")).GET().build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString()).body();
     }
 
     private static Operator<SessionRow, Void> icebergSink(String catalogUri,
@@ -748,6 +771,7 @@ class DistributedCheckpointRecoveryIT {
     }
 
     private static void stopAll(List<ManagedProcess> processes) {
+        boolean interrupted = Thread.interrupted();
         for (int index = processes.size() - 1; index >= 0; index--) {
             Process process = processes.get(index).process();
             if (process.isAlive()) {
@@ -761,10 +785,26 @@ class DistributedCheckpointRecoveryIT {
                     process.destroyForcibly();
                     process.waitFor(3, TimeUnit.SECONDS);
                 }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+            } catch (InterruptedException interruption) {
                 process.destroyForcibly();
+                // Keep awaiting every child even if JUnit interrupted the test on timeout.
+                // Re-interrupting here would make all subsequent waits fail immediately and
+                // leave redirected log handles open while @TempDir tries to delete them.
+                interrupted = true;
             }
+        }
+        for (ManagedProcess managed : processes) {
+            while (managed.process().isAlive()) {
+                managed.process().destroyForcibly();
+                try {
+                    managed.process().waitFor(3, TimeUnit.SECONDS);
+                } catch (InterruptedException again) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

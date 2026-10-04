@@ -293,6 +293,9 @@ services:
       MASTER_HOST: master
       MASTER_PORT: 9090
       MIN_WORKERS: 3
+      LMS_SESSIONS_SALTED: "${LMS_SESSIONS_SALTED:-false}"
+      REUSE_RUNNING_JOB: "true"
+      MASTER_STATUS_URL: http://master:8080
       KAFKA_BOOTSTRAP_SERVERS: kafka:19092
       ICEBERG_CATALOG_URI: http://iceberg-rest:8181
       ICEBERG_WAREHOUSE: s3://warehouse/
@@ -303,29 +306,18 @@ services:
     restart: "no"
 
   seed-fixtures:
-    image: apache/kafka:3.9.0
+    image: lms-stream-engine:phase7
     container_name: lms-seed-fixtures
     depends_on:
       seed-job:
         condition: service_completed_successfully
     volumes:
       - ./demos/fixtures:/fixtures:ro
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -e
-        # Every partition receives a progress record. Silence alone cannot advance event time
-        # and close the 15-minute sessions in this short replay. Round-robin is only fixture
-        # publication; the engine still uses the graph's keyed exchange for aggregation.
-        cat /fixtures/clicks.jsonl /fixtures/click-watermark-progress.jsonl | \
-          /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
-          --producer-property partitioner.class=org.apache.kafka.clients.producer.RoundRobinPartitioner \
-          --producer-property acks=all --topic lms.catalog.clicks
-        cat /fixtures/borrows.jsonl /fixtures/borrow-watermark-progress.jsonl | \
-          /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 \
-          --producer-property partitioner.class=org.apache.kafka.clients.producer.RoundRobinPartitioner \
-          --producer-property acks=all --topic lms.catalog.borrows
-        echo "deterministic click and borrow fixtures published"
+    entrypoint: ["java", "-cp", "/opt/engine/submit/classes:/opt/engine/master/lib/*:/opt/engine/lms/lib/*"]
+    command: ["dev.dhruv.streaming.lms.PublishLmsFixture", "/fixtures"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      FIXTURE_BOOTSTRAP_ONCE: "true"
 
   prometheus:
     image: prom/prometheus:v2.55.1

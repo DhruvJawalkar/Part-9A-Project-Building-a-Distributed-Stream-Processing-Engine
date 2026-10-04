@@ -106,6 +106,33 @@ class StatusApiTest {
         return request("GET", path);
     }
 
+    @Test
+    void escapesAllJsonControlCharactersInNamesAndFailureCauses() throws Exception {
+        metadata.registerWorker(new RegisteredWorker("worker-a", "localhost", 1, 2, 8), 60);
+        String name = "status-api\t\b\f" + (char) 0 + (char) 31 + "\"\\\r\n";
+        JobGraph graph = graph(name);
+        master.submit(graph, new byte[] {1});
+        StringBuilder cause = new StringBuilder("failure:");
+        for (char character = 0; character < 0x20; character++) {
+            cause.append(character);
+        }
+        metadata.putJobFailureCause(graph.jobId(), cause.toString());
+        api = new StatusApi(0, master, metadata);
+        api.start();
+
+        for (String path : List.of("/jobs", "/jobs/" + graph.jobId())) {
+            HttpResponse<String> response = get(path);
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.body()).contains(
+                    "\"name\":\"status-api\\t\\b\\f\\u0000\\u001f\\\"\\\\\\r\\n\"",
+                    "\"failureCause\":\"failure:\\u0000\\u0001",
+                    "\\u001e\\u001f\"");
+            for (char character = 0; character < 0x20; character++) {
+                assertThat(response.body()).doesNotContain(Character.toString(character));
+            }
+        }
+    }
+
     private HttpResponse<String> request(String method, String path) throws Exception {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + api.port() + path))
                 .method(method, HttpRequest.BodyPublishers.noBody()).build();
@@ -113,7 +140,11 @@ class StatusApiTest {
     }
 
     private static JobGraph graph() {
-        JobGraph.Builder job = JobGraph.named("status-api");
+        return graph("status-api");
+    }
+
+    private static JobGraph graph(String name) {
+        JobGraph.Builder job = JobGraph.named(name);
         job.source("source", source()).parallelism(1)
                 .sink("sink", sink()).parallelism(1);
         return job.build();
